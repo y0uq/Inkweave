@@ -1,4 +1,4 @@
-# Inkling Vulkan
+# Inkweave
 
 A performance fork of Unsloth llama.cpp for Inkling 2 Mini on Vulkan. The tuning target is the Radeon RX 9060 XT 16 GiB (gfx1200) and Ryzen 7 9700X (Zen 5). The fork started from [Unsloth b12588-mix-c0c3de8](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8).
 
@@ -29,7 +29,7 @@ GGML_VK_INKLING_BANDED_DECODE=1 GGML_VK_INKLING_DEPTH_MIX=1 GGML_VK_INKLING_FUSE
 GGML_VK_INKLING_BANDED_PROMPT_POSITIONS=1 GGML_VK_INKLING_BOUND_ATTN_SCRATCH=1 \
 LLAMA_INKLING_POLY_MOE=1 LLAMA_INKLING_POLY_SNAPSHOT=1 LLAMA_INKLING_POLY_BATCH_UPLOAD=1 \
 LLAMA_INKLING_DSPARK_DEVICE_FEATURES=1 LLAMA_INKLING_DSPARK_FOLD=1 LLAMA_INKLING_DSPARK_FOLD_Q8=1 \
-    ./build-vulkan/bin/llama-server --models-preset examples/inkling-vulkan-dspark.ini \
+    ./build-vulkan/bin/llama-server --models-preset examples/inkweave-dspark.ini \
     --models-max 1 --offline --mmproj-device none --no-mmproj-offload \
     --host 127.0.0.1 --port 8080
 ```
@@ -40,7 +40,7 @@ The executor shares expert-cache entries across visits to the same physical bloc
 
 The fork also fuses SiTU and residual operations and computes relative attention bias inside Vulkan Flash Attention on RDNA 4. The banded path uses FP32 accumulation and reads a compact position map when the sliding-window cache wraps. The scratch cap switches long requests to direct Q8_0 attention tiles. Direct host access supports a single visible Vulkan device.
 
-Use [the direct preset](examples/inkling-vulkan.ini) for higher prompt throughput with DSpark disabled. For the greedy numbers below, send `temperature: 0` with the request. Tune `moe-cache-mib`, `moe-cache-cpu-share`, `ubatch-size`, and `spec-draft-n-max` in the DSpark preset.
+Use the direct preset for higher prompt throughput with DSpark disabled. The benchmarks below use `temperature: 0`. For normal sampling, Unsloth recommends temperature 1.0, top-p 1.0, top-k disabled, and min-p 0. Tune `moe-cache-mib`, `moe-cache-cpu-share`, `ubatch-size`, and `spec-draft-n-max` in the DSpark preset. [Direct preset](examples/inkweave.ini) · [Unsloth sampling settings](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/Mainline_Support/README.md)
 
 
 ## RX 9060 XT measurements
@@ -59,18 +59,18 @@ On the testing system, the original Unsloth release delivered **165.92 tok/s pre
 
 The first four rows average two measurements per rate. The direct run used one measurement per rate. In a separate diagnostic with the model fully resident in VRAM and the context reduced to 4,096, stock Vulkan reached 400.86 tok/s prefill and 24.33 tok/s generation. Its decode graph still had 194 splits.
 
-### Inkling Vulkan iterations
+### Inkweave iterations
 
 Measured on the same RX 9060 XT and Ryzen 7 9700X with Inkling 2 Mini UD-Q3_K_XL, an 8,195-token mixed prompt, 128 generated tokens, greedy sampling, and 262,144 allocated context tokens.
 
 | Profile | Prefill (tok/s) | Generation (tok/s) | Minimum free VRAM during generation |
 | --- | ---: | ---: | ---: |
-| First Inkling Vulkan iteration (`6e5256529`), direct | 840.77 | 27.79 | 3,422 MiB |
+| First Inkweave iteration (`6e5256529`), direct | 840.77 | 27.79 | 3,422 MiB |
 | Tuned direct | **1,095.17** | 34.48 | 3,488 MiB |
 | Mixed expert execution, direct | 929.53 | 32.56 | 4,259 MiB |
 | Mixed expert execution and four DSpark guesses | 898.88 | **56.15** | 2,899 MiB |
 
-Against the first Inkling Vulkan iteration on the 8K fixture, the tuned direct path improved prefill by 30% and generation by 24%. The four-guess DSpark profile reached 2.02× the first iteration's generation rate. On the 49-token code fixture, generation progressed from 30.00 tok/s in the first iteration to 36.18 tok/s with tuned direct and 50.16 tok/s with four guesses. Early fork tests on the 79-token prompt measured 13.66 tok/s with two guesses and 26.87 tok/s with direct decoding.
+Against the first Inkweave iteration on the 8K fixture, the tuned direct path improved prefill by 30% and generation by 24%. The four-guess DSpark profile reached 2.02× the first iteration's generation rate. On the 49-token code fixture, generation progressed from 30.00 tok/s in the first iteration to 36.18 tok/s with tuned direct and 50.16 tok/s with four guesses. Early fork tests on the 79-token prompt measured 13.66 tok/s with two guesses and 26.87 tok/s with direct decoding.
 
 The four-guess profile matched all 128 greedy tokens from the tuned direct reference on both fixtures. It maintained at least 2,899 MiB free during generation, 339 MiB above the test floor. Acceptance was 99 of 109 proposals at 8K and 90 of 148 on code. Rates vary with prompt, sampling and acceptance. The 262,144-token allocations were verified at load, and near-full generation headroom for the four-guess preset still needs qualification.
 
