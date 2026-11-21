@@ -45,16 +45,32 @@ Use [the direct preset](examples/inkling-vulkan.ini) for higher prompt throughpu
 
 ## RX 9060 XT measurements
 
+### Stock Unsloth starting point
+
+On Zeus, the original Unsloth release delivered **165.92 tok/s prefill and 8.87 tok/s generation** with static expert offload and three DSpark guesses. These runs used a 262,144-token context, Q8_0 K/V, Flash Attention, and the same UD-Q3_K_XL target. Prefill was measured on a 1,825-token prompt. Generation was measured separately on a 79-token prompt with 96 generated tokens. [Original Unsloth release](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8)
+
+| Stock Vulkan profile | DSpark guesses | Prefill (tok/s) | Generation (tok/s) |
+| --- | ---: | ---: | ---: |
+| Static expert offload | 3 | 165.92 | 8.87 |
+| Pinned RAM experts, 3,072 MiB Vulkan cache | 3 | 148.63 | 9.45 |
+| Same cache, 50% CPU share for eligible misses | 3 | 146.99 | 8.84 |
+| Pinned RAM experts, 3,200 MiB Vulkan cache | 2 | 151.58 | 11.33 |
+| Same 3,200 MiB cache, direct | 0 | 153.34 | 16.24 |
+
+The first four rows average two measurements per rate. The direct run used one measurement per rate. In a separate diagnostic with the model fully resident in VRAM and the context reduced to 4,096, stock Vulkan reached 400.86 tok/s prefill and 24.33 tok/s generation. Its decode graph still had 194 splits.
+
+### Inkling Vulkan iterations
+
 Measured on the same RX 9060 XT and Ryzen 7 9700X with Inkling 2 Mini UD-Q3_K_XL, an 8,195-token mixed prompt, 128 generated tokens, greedy sampling, and 262,144 allocated context tokens.
 
 | Profile | Prefill (tok/s) | Generation (tok/s) | Minimum free VRAM during generation |
 | --- | ---: | ---: | ---: |
-| Previous public fork (`6e5256529`), direct | 840.77 | 27.79 | 3,422 MiB |
+| First Inkling Vulkan iteration (`6e5256529`), direct | 840.77 | 27.79 | 3,422 MiB |
 | Tuned direct | **1,095.17** | 34.48 | 3,488 MiB |
 | Mixed expert execution, direct | 929.53 | 32.56 | 4,259 MiB |
 | Mixed expert execution and four DSpark guesses | 898.88 | **56.15** | 2,899 MiB |
 
-The tuned direct path improved prefill by 30% and generation by 24% over the previous fork on the 8K fixture. With DSpark, generation reached 2.02× the previous fork's rate. On the 49-token code fixture, generation progressed from 30.00 tok/s on the previous fork to 36.18 tok/s with tuned direct and 50.16 tok/s with four guesses. Earlier DSpark tests on a separate 79-token prompt measured 13.66 tok/s with two guesses and 26.87 tok/s with direct decoding.
+Against the first Inkling Vulkan iteration on the 8K fixture, the tuned direct path improved prefill by 30% and generation by 24%. The four-guess DSpark profile reached 2.02× the first iteration's generation rate. On the 49-token code fixture, generation progressed from 30.00 tok/s in the first iteration to 36.18 tok/s with tuned direct and 50.16 tok/s with four guesses. Early fork tests on the 79-token prompt measured 13.66 tok/s with two guesses and 26.87 tok/s with direct decoding.
 
 The four-guess profile matched all 128 greedy tokens from the tuned direct reference on both fixtures. It maintained at least 2,899 MiB free during generation, 339 MiB above the test floor. Acceptance was 99 of 109 proposals at 8K and 90 of 148 on code. Rates vary with prompt, sampling and acceptance. The 262,144-token allocations were verified at load, and near-full generation headroom for the four-guess preset still needs qualification.
 
