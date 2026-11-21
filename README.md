@@ -22,7 +22,7 @@ From the repository root, download the model and projector and launch the OpenAI
 ```sh
 uvx --from huggingface-hub hf download unsloth/Inkling-2-Mini-GGUF \
     Inkling-2-Mini-UD-Q3_K_XL.gguf mmproj-F16.gguf --local-dir models/Inkling
-GGML_VK_VISIBLE_DEVICES=0 GGML_VK_DIRECT_HOST=1 \
+GGML_VK_VISIBLE_DEVICES=0 GGML_VK_DIRECT_HOST=1 GGML_VK_INKLING_BANDED=1 \
     ./build-vulkan/bin/llama-server --models-preset examples/inkling-vulkan.ini \
     --models-max 1 --offline --mmproj-device none --no-mmproj-offload \
     --host 127.0.0.1 --port 8080
@@ -30,9 +30,24 @@ GGML_VK_VISIBLE_DEVICES=0 GGML_VK_DIRECT_HOST=1 \
 
 The preset uses a 262,144-token context with Q8_0 K/V and Flash Attention. The RX 9060 XT configuration uses Vulkan0 for language inference and the CPU for the projector. The most frequently visited blocks keep their experts in VRAM. Vulkan buffers expose the other experts in pinned RAM to the GPU so routing and compute can run without per-layer CPU readbacks. Direct host access is opt-in and supports one visible Vulkan device.
 
-The fork also fuses the SiTU expert activation on Vulkan, shares expert-cache entries across visits to the same physical block, reuses normalized previous-pass states, and caps the size of relative attention bias tiles. DSpark is configurable in the preset.
+The fork also fuses the SiTU expert activation on Vulkan, shares expert-cache entries across visits to the same physical block, reuses normalized residual states, and computes relative attention bias inside the Vulkan Flash Attention kernel on RDNA 4. This banded path uses Q8_0 K/V, FP32 accumulation, and position-contiguous cache ranges in a single sequence. The engine tiles the dense mask when it needs the fallback path. DSpark is configurable in the preset.
 
-Use `--list-devices` to identify the Vulkan device on other systems. Tune `n-cpu-moe` and `override-tensor` for the available VRAM.
+Use `--list-devices` to identify the Vulkan device on other systems. Tune `n-cpu-moe`, `override-tensor`, and `ubatch-size` for the available VRAM. The dense attention fallback can require more scratch space.
+
+To compare dynamic caching, set `GGML_VK_DIRECT_HOST=0`, replace `n-cpu-moe` with `cpu-moe = true`, leave only the token-embedding placement in `override-tensor`, and set `moe-cache-mib` for the available VRAM.
+
+
+## RX 9060 XT measurements
+
+Measured with the included preset, Inkling 2 Mini UD-Q3_K_XL, 262,144 allocated context tokens, and greedy generation.
+
+| Prompt workload | Prefill (tok/s) | Generation (tok/s) | Minimum free VRAM |
+| --- | ---: | ---: | ---: |
+| 1,825-token prefill and separate short-prompt decode | 763.7 | 29.7 | 3.01 GiB |
+| 8,195-token prompt followed by 64 generated tokens | 632.7 | 27.3 | 3.01 GiB |
+| 32,835-token prompt followed by 64 generated tokens | 569.9 | 24.9 | 2.80 GiB |
+
+Free VRAM was sampled across the requests, including generation. The 32,835-token prompt was the longest measured. The preset keeps DSpark disabled for speed. The Q8_0 drafter is available from the same Hugging Face repository as `dspark-Inkling-2-Mini-Q8_0.gguf`.
 
 <details>
 <summary>Upstream llama.cpp README</summary>

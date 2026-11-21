@@ -38,6 +38,7 @@ layout (binding = 1) readonly buffer KV4 {FLOAT_TYPEV4 data_kv4[];};
 layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
 layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 7) readonly buffer Rel {float data_rel[];};
 
 shared float tmpsh[row_split];
 
@@ -209,6 +210,9 @@ void main() {
         mo_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * CEIL_DIV(p.nem1, Br) * mo_stride;
     }
 
+    // Binding 7 holds either sparse row indices or the banded relative bias.
+    const bool banded = (p.mask_n_head_log2 & (1u << 25)) != 0;
+    const uint32_t extent = p.mask_n_head_log2 & N_LOG2_MASK;
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
@@ -231,6 +235,9 @@ void main() {
                 // skip this block
                 continue;
             }
+            if (banded && mask_opt_bits == MASK_OPT_ALL_ZERO) {
+                mask_opt_bits = 0;
+            }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
@@ -244,7 +251,21 @@ void main() {
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active) {
                             f16vec4 m;
-                            if (USE_SPARSE) {
+                            if (banded) {
+                                m = f16vec4(0);
+                                [[unroll]] for (uint a = 0; a < 4; ++a) {
+                                    const uint row = i * Br + r * 4 + a;
+                                    if (row < p.nem1) {
+                                        const int dist = int(KV - N + row) - int(kcol);
+                                        const uint head_row = row * p.neq2 + iq2;
+                                        const float bias = dist >= 0 && dist < int(extent) ?
+                                            data_rel[head_row * extent + uint(dist)] : 0.0f;
+                                        const float mask = float(data_m[m_offset + row * m_stride + kcol]);
+                                        m[a] = float16_t(mask + (bias - data_s[head_row]));
+                                        max_mask = max(max_mask, float(m[a]));
+                                    }
+                                }
+                            } else if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);
@@ -683,7 +704,7 @@ void main() {
 
     if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            float sink = perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2);
+            float sink = banded ? 0.0 : float(perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2));
 
             float ms = 1.0f;
             float vs = 1.0f;

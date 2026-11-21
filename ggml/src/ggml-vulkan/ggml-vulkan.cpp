@@ -9021,6 +9021,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
+    const ggml_tensor * rel = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
     const uint32_t nem0 = mask ? mask->ne[0] : 0;
     const uint32_t nem1 = mask ? mask->ne[1] : 0;
     const uint32_t nem2 = mask ? mask->ne[2] : 0;
@@ -9103,10 +9104,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const ggml_type v_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : v->type;
 
     // N=32 avoids the cm1 prefill block_rows doubling
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, rel == nullptr);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    if (!rel && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -9116,7 +9117,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, rel == nullptr);
+
+    GGML_ASSERT(!rel || (tuning_params.path == FA_COOPMAT1 && !tuning_params.flip));
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -9142,7 +9145,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !rel && !disable_sparse && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
                             nem0 == KV &&
@@ -9347,6 +9350,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = CEIL_DIV(KV, split_kv);
     }
 
+    // The split-K reduction accepts one sink per head, while banded attention has one per query.
+    if (rel) {
+        split_k = 1;
+        split_kv = KV;
+    }
+
     if (xe_fa_opt) {
         // Bypass mask_opt and split_k buffer grow when they are not in use
         use_mask_opt = false;
@@ -9433,7 +9442,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
-    vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+    vk_subbuffer extra_buf = q_buf;
+    if (rel) {
+        extra_buf = ggml_vk_tensor_subbuffer(ctx, rel);
+    } else if (use_sparse) {
+        extra_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
+    }
     if (use_mask_opt || use_sparse) {
         // the mask opt bits and the sparse index list overwrite a matmul input converted into prealloc_y
         ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -9498,6 +9512,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
+    if (rel) {
+        // There is no ALiBi slope in banded attention. Use its low bits for the relative extent.
+        mask_n_head_log2 = (1u << 24) | (1u << 25) | uint32_t(rel->ne[0]);
+    }
+
     if (use_mask_opt)
     {
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
@@ -9531,7 +9550,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         };
 
         ggml_vk_dispatch_pipeline(ctx, subctx, sparse_compact_pipeline,
-                                  { mask_buf, sparse_buf }, sc_pc,
+                                  { mask_buf, extra_buf }, sc_pc,
                                   { nem1, nem2, nem3 });
         ggml_vk_sync_buffers(ctx, subctx);
     }
@@ -9621,7 +9640,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, sparse_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, extra_buf},
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
@@ -9636,7 +9655,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             workgroups_x *= pipeline->wg_denoms[0];
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, sparse_buf},
+                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, extra_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
 
@@ -13893,6 +13912,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_FLASH_ATTN_EXT_BANDED:
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
 
@@ -16794,6 +16814,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_FLASH_ATTN_EXT_BANDED: {
+            static const char * enabled = getenv("GGML_VK_INKLING_BANDED");
+            const auto * rel = op->src[6];
+            const auto * sink = op->src[4];
+            if (!enabled || strcmp(enabled, "1") != 0 || device->architecture != vk_device_architecture::AMD_RDNA4 ||
+                device->coopmat2 || !device->coopmat1_fa_support || !device->coopmat_support_16x16x16_f32acc ||
+                !op->src[3] || op->src[3]->ne[2] != 1 || op->src[3]->ne[3] != 1 ||
+                op->src[1]->type != GGML_TYPE_Q8_0 || op->src[2]->type != GGML_TYPE_Q8_0 ||
+                op->src[1]->ne[0] != 128 || op->src[2]->ne[0] != 128 || op->src[0]->ne[1] <= 32 ||
+                !rel || rel->type != GGML_TYPE_F32 || rel->ne[0] > 65535 || !ggml_is_contiguous(rel) ||
+                !sink || sink->ne[0] != op->src[0]->ne[2] || sink->ne[1] != op->src[0]->ne[1] ||
+                op->src[0]->ne[3] != 1 || !ggml_is_contiguous(sink) || ggml_prec_get_acc(op) != GGML_PREC_F32) {
+                return false;
+            }
+            [[fallthrough]];
+        }
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 // K/V row lists (ggml_flash_attn_ext_rows) are not supported
