@@ -577,7 +577,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 }
 
 bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor * dst) {
-    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED || dst->src[7]) {
         return false;
     }
 

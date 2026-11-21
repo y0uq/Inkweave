@@ -1486,6 +1486,9 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
+    if (banded_swa_positions && banded_swa_positions->buffer) {
+        attn_ctx->get_swa()->set_input_banded_positions(banded_swa_positions, ubatch);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1533,7 +1536,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     if (banded) {
         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        const uint32_t swa_contiguous = attn_ctx->get_swa()->get_n_kv_pos_contiguous();
+        const bool swa_explicit = swa_contiguous == 0 && params.ubatch.n_seqs_unq == 1;
+        res &= banded_swa_explicit == swa_explicit;
+        res &= (swa_explicit ? attn_ctx->get_swa()->get_n_kv() : swa_contiguous) == n_kv_banded[1];
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();

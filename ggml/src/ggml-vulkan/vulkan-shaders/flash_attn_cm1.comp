@@ -39,6 +39,9 @@ layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
 layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 layout (binding = 7) readonly buffer Rel {float data_rel[];};
+#ifdef INKLING_KV_POS_MAP
+layout (binding = 8) readonly buffer Pos {int data_positions[];};
+#endif
 
 shared float tmpsh[row_split];
 
@@ -253,10 +256,20 @@ void main() {
                             f16vec4 m;
                             if (banded) {
                                 m = f16vec4(0);
+#ifdef INKLING_KV_POS_MAP
+                                const int key_pos = data_positions[N + kcol];
+#else
+                                const int key_pos = int(kcol);
+#endif
                                 [[unroll]] for (uint a = 0; a < 4; ++a) {
                                     const uint row = i * Br + r * 4 + a;
                                     if (row < p.nem1) {
-                                        const int dist = int(KV - N + row) - int(kcol);
+#ifdef INKLING_KV_POS_MAP
+                                        const int query_pos = data_positions[row];
+#else
+                                        const int query_pos = int(KV - N + row);
+#endif
+                                        const int dist = query_pos - key_pos;
                                         const uint head_row = row * p.neq2 + iq2;
                                         const float bias = dist >= 0 && dist < int(extent) ?
                                             data_rel[head_row * extent + uint(dist)] : 0.0f;

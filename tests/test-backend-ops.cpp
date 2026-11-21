@@ -9318,9 +9318,14 @@ struct test_flash_attn_ext_banded : public test_case {
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
+    const int64_t kv_rotation;
+
+    int32_t key_pos(int64_t row) const {
+        return (row + kv_rotation) % n_kv;
+    }
 
     std::string vars() override {
-        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
+        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided) + ",kv_rotation=" + std::to_string(kv_rotation);
     }
 
     double max_nmse_err() override {
@@ -9338,9 +9343,9 @@ struct test_flash_attn_ext_banded : public test_case {
     test_flash_attn_ext_banded(
             int64_t d, int64_t n_head, int64_t n_head_kv,
             int64_t n_q, int64_t n_kv, int64_t rel_extent,
-            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false)
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false, int64_t kv_rotation = 0)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
-          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided) {}
+          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided), kv_rotation(kv_rotation) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
@@ -9371,6 +9376,11 @@ struct test_flash_attn_ext_banded : public test_case {
         }
 
         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
+        if (kv_rotation != 0) {
+            ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q + n_kv);
+            ggml_set_name(positions, "positions");
+            ggml_flash_attn_ext_banded_set_positions(out, positions);
+        }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -9382,12 +9392,21 @@ struct test_flash_attn_ext_banded : public test_case {
                 std::vector<ggml_fp16_t> data(n_q*n_kv);
                 for (int64_t iq = 0; iq < n_q; ++iq) {
                     for (int64_t ik = 0; ik < n_kv; ++ik) {
-                        const int64_t rel_dist = iq + (n_kv - n_q) - ik;
+                        const int64_t rel_dist = iq + (n_kv - n_q) - key_pos(ik);
                         const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
                         data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "positions") == 0) {
+                std::vector<int32_t> positions(n_q + n_kv);
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    positions[iq] = n_kv - n_q + iq;
+                }
+                for (int64_t ik = 0; ik < n_kv; ++ik) {
+                    positions[n_q + ik] = key_pos(ik);
+                }
+                ggml_backend_tensor_set(t, positions.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "rel_logits") == 0) {
                 init_tensor_uniform(t, -1.0f, 1.0f);
             } else {
@@ -9405,8 +9424,8 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 
     test_flash_attn_ext_banded_sinks(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
-            int mask_kind, ggml_type kv_type, ggml_type rel_type, int sinks, bool strided = false)
-        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided), sinks(sinks) {}
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, int sinks, bool strided = false, int64_t kv_rotation = 0)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, kv_rotation), sinks(sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_flash_attn_ext_banded::build_graph(ctx);
@@ -13685,6 +13704,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512, 3000, 1024, 2, GGML_TYPE_BF16, GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   79,   79, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512, 2048, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512, 2048, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, 731));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 1, 4096, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));

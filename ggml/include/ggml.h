@@ -2285,6 +2285,11 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // Override the implicit positions with an I32 vector [Q positions, K positions] for one stream.
+    GGML_API void ggml_flash_attn_ext_banded_set_positions(
+            struct ggml_tensor * a,
+            struct ggml_tensor * positions);
+
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]
     // k:       [n_embd_k, n_rows,  n_head_kv, 1  ] shared by all q slices

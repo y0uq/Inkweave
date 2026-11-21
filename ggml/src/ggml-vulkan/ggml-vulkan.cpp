@@ -1474,6 +1474,8 @@ static uint32_t fa_block_bytes(ggml_type t) {
     return (uint32_t) ggml_type_size(t);
 }
 
+static constexpr uint32_t fa_flag_inkling_kv_pos_map = 1u << 8;
+
 static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
     return {
         /* 0 WorkGroupSize   */ state.workgroup_size,
@@ -2389,12 +2391,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool fa_ds = fa.first.subgroup_size == 0;
 
             const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
+            const bool pos_map = (fa.first.flags & fa_flag_inkling_kv_pos_map) != 0;
             const bool flip = (fa.first.flags & 64) != 0;
 
             const void * spv_data;
             size_t spv_size;
             const char *name;
-            if (bf16_kv) {
+            if (pos_map) {
+                GGML_ASSERT(!bf16_kv && !flip && f32acc);
+                spv_data = flash_attn_f32_f16_pos_map_cm1_data;
+                spv_size = flash_attn_f32_f16_pos_map_cm1_len;
+                name = "flash_attn_f32_f16_pos_map_cm1";
+            } else if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
                 if (flip) {
@@ -2418,7 +2426,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", pos_map ? 9 : 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -9022,6 +9030,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
 
     const ggml_tensor * rel = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
+    const ggml_tensor * positions = rel ? dst->src[7] : nullptr;
     const uint32_t nem0 = mask ? mask->ne[0] : 0;
     const uint32_t nem1 = mask ? mask->ne[1] : 0;
     const uint32_t nem2 = mask ? mask->ne[2] : 0;
@@ -9208,6 +9217,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (positions) {
+        fa_pipeline_state.flags |= fa_flag_inkling_kv_pos_map;
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -9654,9 +9666,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, extra_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (positions) {
+            const auto positions_buf = ggml_vk_tensor_subbuffer(ctx, positions);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                      {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, extra_buf, positions_buf},
+                                      pc, { workgroups_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                      {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, extra_buf},
+                                      pc, { workgroups_x, workgroups_y, workgroups_z });
+        }
     }
 
     if (use_dequant_kv) {
@@ -16818,6 +16837,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             static const char * enabled = getenv("GGML_VK_INKLING_BANDED");
             const auto * rel = op->src[6];
             const auto * sink = op->src[4];
+            const auto * positions = op->src[7];
+            if (positions && (device->properties.limits.maxPerStageDescriptorStorageBuffers < 9 ||
+                              device->properties.limits.maxDescriptorSetStorageBuffers < 9)) {
+                return false;
+            }
             if (!enabled || strcmp(enabled, "1") != 0 || device->architecture != vk_device_architecture::AMD_RDNA4 ||
                 device->coopmat2 || !device->coopmat1_fa_support || !device->coopmat_support_16x16x16_f32acc ||
                 !op->src[3] || op->src[3]->ne[2] != 1 || op->src[3]->ne[3] != 1 ||

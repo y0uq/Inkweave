@@ -5566,6 +5566,14 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_set_positions(struct ggml_tensor * a, struct ggml_tensor * positions) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->src[0]->ne[3] == 1);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32 && ggml_is_vector(positions) && ggml_is_contiguous(positions));
+    GGML_ASSERT(positions->ne[0] == a->src[0]->ne[1] + a->src[1]->ne[1]);
+    a->src[7] = positions;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

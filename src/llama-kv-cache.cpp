@@ -2085,6 +2085,19 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
+void llama_kv_cache::set_input_banded_positions(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ubatch->n_seqs_unq == 1);
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    const auto n_q = ubatch->n_tokens;
+    std::vector<int32_t> positions(dst->ne[0]);
+    GGML_ASSERT(positions.size() >= n_q && positions.size() - n_q <= cells.size());
+    std::copy_n(ubatch->pos, n_q, positions.data());
+    for (size_t j = 0; j < positions.size() - n_q; ++j) {
+        positions[n_q + j] = cells.is_empty(j) ? 0 : cells.pos_get(j);
+    }
+    ggml_backend_tensor_set(dst, positions.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     const int64_t n_kv = dst->ne[0];
@@ -3221,6 +3234,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_pos_rel_flat(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_banded_positions(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_banded_positions(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

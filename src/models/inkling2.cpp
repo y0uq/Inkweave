@@ -302,10 +302,14 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
-    // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
+    // Small ubatches stay on the dense path for graph reuse.
     inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
     for (int i = 0; i < 2 && inp->banded; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+    }
+    inp->banded_swa_explicit = inp->banded && inp->n_kv_banded[1] == 0 && ubatch.n_seqs_unq == 1;
+    if (inp->banded_swa_explicit) {
+        inp->n_kv_banded[1] = attn->mctx->get_swa()->get_n_kv();
     }
     ggml_tensor * banded_masks[2] = {};
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
@@ -339,6 +343,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, n_tokens, 1);
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
         ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, n_tokens, 1));
+        if (swa && inp->banded_swa_explicit) {
+            ggml_flash_attn_ext_banded_set_positions(op, ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2 * n_tokens));
+        }
         ggml_prec_set_acc(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
         banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -535,6 +542,14 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
                 cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
                 ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+                if (is_swa && inp->banded_swa_explicit) {
+                    if (!inp->banded_swa_positions) {
+                        inp->banded_swa_positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens + n_kv_b);
+                        ggml_set_input(inp->banded_swa_positions);
+                        ggml_set_name(inp->banded_swa_positions, "attn_banded_swa_positions");
+                    }
+                    ggml_flash_attn_ext_banded_set_positions(cur, inp->banded_swa_positions);
+                }
                 ggml_prec_set_acc(cur, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

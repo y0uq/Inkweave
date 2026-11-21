@@ -844,7 +844,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     GGML_UNUSED(dst);
     return false;
 #else
-    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED || dst->src[7]) {
         return false;
     }
 
