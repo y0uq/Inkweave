@@ -47,7 +47,7 @@ Use [the direct preset](examples/inkling-vulkan.ini) for higher prompt throughpu
 
 ### Stock Unsloth starting point
 
-On Zeus, the original Unsloth release delivered **165.92 tok/s prefill and 8.87 tok/s generation** with static expert offload and three DSpark guesses. These runs used a 262,144-token context, Q8_0 K/V, Flash Attention, and the same UD-Q3_K_XL target. Prefill was measured on a 1,825-token prompt. Generation was measured separately on a 79-token prompt with 96 generated tokens. [Original Unsloth release](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8)
+On the testing system, the original Unsloth release delivered **165.92 tok/s prefill and 8.87 tok/s generation** with static expert offload and three DSpark guesses. These runs used a 262,144-token context, Q8_0 K/V, Flash Attention, and the same UD-Q3_K_XL target. Prefill was measured on a 1,825-token prompt. Generation was measured separately on a 79-token prompt with 96 generated tokens. [Original Unsloth release](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8)
 
 | Stock Vulkan profile | DSpark guesses | Prefill (tok/s) | Generation (tok/s) |
 | --- | ---: | ---: | ---: |
