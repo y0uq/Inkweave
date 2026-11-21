@@ -107,6 +107,13 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
 static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
+
+// compute correction dims for YaRN RoPE scaling
+GGML_API void ggml_rope_yarn_corr_dims(
+    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, bool truncate, float dims[2]);
+
+GGML_API bool ggml_rope_get_truncate(const struct ggml_tensor * a);
+
 //
 // logging
 //
@@ -172,6 +179,11 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 //   1 - hint
 //   2 - src0 precision
 //   3 - src1 precision
+//
+// - GGML_OP_FLASH_ATTN_EXT
+// - GGML_OP_FLASH_ATTN_EXT_BANDED
+//   0..2 - scale, max_bias, logit_softcap (f32)
+//   3    - acc
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;
@@ -512,6 +524,7 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    // TODO: reject invalid unsigned E4M3 scales instead of decoding NaN as zero or ignoring the sign bit.
     if (x == 0 || x == 0x7F) {
         return 0.0f;
     }
@@ -527,6 +540,7 @@ static inline float ggml_ue4m3_to_fp32(uint8_t x) {
 }
 
 static inline uint8_t ggml_fp32_to_ue4m3(float x) {
+    // TODO: use ties-to-even rounding, allow subnormal carry, and preserve finite values with exponent field 15.
     if (!(x > 0.0f)) {
         return 0;
     }
@@ -562,6 +576,108 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
         }
     }
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// E4M3 (fn): signed, 4 exp bits (bias=7), 3 mantissa bits, no inf, 0x7F/0xFF = NaN (used by MXFP8)
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = x & 0x80;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    float v;
+    if (exp == 0xF && man == 0x7) {
+        v = NAN;
+    } else if (exp == 0) {
+        v = ldexpf((float) man, -9);
+    } else {
+        v = ldexpf((float) (8 + man), exp - 10);
+    }
+    return sign ? -v : v;
+}
+
+// fp32 -> E4M3 (fn), round to nearest even, saturating to +-448, NaN -> 0x7F
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    if (x != x) {
+        return 0x7F;
+    }
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    float a = fabsf(x);
+    if (a >= 448.0f) {
+        return sign | 0x7E;
+    }
+    if (a < 0.015625f) { // subnormal grid 2^-9
+        const int m = (int) nearbyintf(a * 512.0f);
+        return sign | (uint8_t) m;
+    }
+    int e;
+    const float f = frexpf(a, &e);
+    int m = (int) nearbyintf((f * 2.0f - 1.0f) * 8.0f);
+    int E = e - 1 + 7;
+    if (m == 8) {
+        m = 0;
+        E++;
+    }
+    if (E > 15 || (E == 15 && m == 7)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) ((E << 3) | m);
+}
+
+static inline float ggml_f8_e4m3_to_fp32(uint8_t x) {
+    const uint8_t ax = x & 0x7F;
+    if (ax == 0x7F) {
+        // OCP FP8 defines both 0x7F and 0xFF as NaN; the sign need not be preserved.
+        return NAN;
+    }
+
+    const uint32_t exp = (ax >> 3) & 0xF;
+    const uint32_t man = ax & 0x7;
+    // OCP FP8 rev. 1.1, section 5.1: subnormal magnitude = M * 2^-9; normal magnitude = (1 + M / 8) * 2^(E - 7).
+    // a normal value maps to fp32 exponent E + 120 and the top 3 mantissa bits
+    const float value = exp == 0
+        ? (float) man * (1.0f / 512.0f)
+        : fp32_from_bits(((exp + 120) << 23) | (man << 20));
+    // set the sign bit without a branch, the sign of real data is random
+    return fp32_from_bits(fp32_to_bits(value) | ((uint32_t) (x & 0x80) << 24));
+}
+
+static inline int ggml_round_to_nearest_even(float x) {
+    const int value = (int) floorf(x);
+    const float fraction = x - value;
+    return fraction > 0.5f || (fraction == 0.5f && (value & 1)) ? value + 1 : value;
+}
+
+// Supports saturating conversion only; infinities and overflow clamp to +/-448.
+static inline uint8_t ggml_fp32_to_f8_e4m3(float x) {
+    const uint8_t sign = signbit(x) ? 0x80 : 0;
+    x = fabsf(x);
+
+    if (isnan(x)) {
+        // OCP FP8 leaves NaN sign handling to the implementation; use canonical 0x7F.
+        return 0x7F;
+    }
+    if (x == 0.0f) {
+        return sign;
+    }
+    if (isinf(x) || x >= 448.0f) {
+        return sign | 0x7E;
+    }
+    if (x < 0.015625f) {
+        // OCP FP8 rev. 1.1, section 5.1: subnormal magnitude = M * 2^(1 - bias - m) = M / 512.
+        return sign | (uint8_t) ggml_round_to_nearest_even(x * 512.0f);
+    }
+
+    int exp;
+    const float mantissa = frexpf(x, &exp) * 2.0f;
+    int encoded_exp = exp + 6;
+    int encoded_man = ggml_round_to_nearest_even((mantissa - 1.0f) * 8.0f);
+    if (encoded_man == 8) {
+        encoded_man = 0;
+        encoded_exp++;
+    }
+    if (encoded_exp > 15 || (encoded_exp == 15 && encoded_man > 6)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
 }
 
 /**

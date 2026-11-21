@@ -1,6 +1,8 @@
 #include "fit.h"
 
+#include "common.h"
 #include "json.h"
+#include "llama-cpp.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
@@ -9,6 +11,8 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <memory>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <vector>
@@ -27,47 +31,82 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// --moe-cache-mib auto keeps the layer split instead of a MoE cache when the split would hold at least this share of the
+// expert weights in device memory (calibrated in the measurements on the pull request)
+static constexpr double MOE_CACHE_AUTO_MAX_RESIDENT = 0.80;
+
+// RAII: send llama logs below min_level to the debug log
+struct common_fit_log_scope {
+    common_fit_log_scope(ggml_log_level min_level) : min_level(min_level) {
+        llama_log_get(&original_logger.callback, &original_logger.user_data);
+        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+            const common_fit_log_scope * self = (const common_fit_log_scope *) user_data;
+            const ggml_log_level level_eff = level >= self->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+            self->original_logger.callback(level_eff, text, self->original_logger.user_data);
+        }, this);
+    }
+
+    ~common_fit_log_scope() {
+        llama_log_set(original_logger.callback, original_logger.user_data);
+    }
+
+    common_fit_log_scope(const common_fit_log_scope &) = delete;
+    common_fit_log_scope & operator=(const common_fit_log_scope &) = delete;
+
+private:
+    struct {
+        ggml_log_callback callback;
+        void * user_data;
+    } original_logger;
+    ggml_log_level min_level;
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
-        const char * path_model,
+        const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
+        uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
-    struct user_data_t {
-        struct {
-            ggml_log_callback callback;
-            void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
-    };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
-
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
+        ggml_log_level log_level,
+        size_t * moe_cache_min_size = nullptr) {
+    common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    llama_model * model = common_model_load(paths_model, mparams_copy);
     if (model == nullptr) {
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    // a draft measured next to its target (ctx_other set by common_fit_draft_target): the speculative decoder turns on
+    // nextn embeddings for DFlash/DSpark/Eagle3 drafts after creating them and installs the backend samplers only on
+    // those (not on DFlash2 / LiliCorr), so do the same and reserve again: the breakdown below then covers the compute
+    // graph the draft actually runs with
+    if (cparams->ctx_other != nullptr) {
+        const bool spec_draft = llama_model_target_layer_ids_n(model) > 0;
+        char buf[32] = {};
+        const bool is_lilicorr = llama_model_meta_val_str(model, "lilicorr.candidate_topk", buf, sizeof(buf)) >= 0 && std::atoi(buf) > 0;
+        const bool is_dflash2  = llama_model_dflash_selector_top_k(model) > 0;
+        if (!spec_draft || is_dflash2 || is_lilicorr) {
+            for (size_t i = 0; i < cparams->n_samplers; i++) {
+                llama_set_sampler(ctx, cparams->samplers[i].seq_id, nullptr);
+            }
+        }
+        if (spec_draft) {
+            llama_set_embeddings_nextn(ctx, true, /*masked*/ !is_dflash2 && !is_lilicorr);
+        }
+        llama_sched_reserve(ctx);
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -137,33 +176,110 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
-    hp_ngl         = llama_model_n_layer(model);
+    hp_ngl         = llama_model_n_layer_weights(model);
     if (mparams->load_mtp) {
         hp_ngl    += llama_model_n_layer_nextn(model);
     }
+    // without MTP the NextN layers hold no weights but the model loader still counts them for n_gpu_layers
+    hp_ngl_skip    = mparams->load_mtp ? 0 : llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+
+    if (moe_cache_min_size) {
+        *moe_cache_min_size = llama_model_moe_cache_min_size(model);
+    }
 
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
     llama_model_free(model);
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
 }
 
+std::vector<common_memory_breakdown_row> common_fit_measure(
+        const std::vector<std::string> & paths_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint32_t * n_ctx_train,
+        uint32_t * n_ctx,
+        ggml_log_level log_level) {
+    common_fit_log_scope log_scope(log_level);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model_ptr model(common_model_load(paths_model, mparams_copy));
+    if (!model) {
+        throw std::runtime_error("failed to load model");
+    }
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), *cparams));
+    if (!ctx) {
+        throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    if (n_ctx_train) {
+        *n_ctx_train = llama_model_n_ctx_train(model.get());
+    }
+    if (n_ctx) {
+        *n_ctx = llama_n_ctx(ctx.get());
+    }
+
+    return common_memory_breakdown_rows(ctx.get());
+}
+
+common_memory_reports common_measure_memory(common_params & params) {
+    const ggml_log_level log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+    const std::vector<std::string> paths_model = params.model.get_paths();
+
+    common_memory_reports res;
+
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+
+    // max: what --fit picks now, no-op with -fit off
+    {
+        auto mparams_fit = mparams;
+        auto cparams_fit = cparams;
+        common_fit_apply(params, mparams_fit, cparams_fit);
+        res.info_max = common_fit_measure(paths_model, &mparams_fit, &cparams_fit, &res.n_ctx_train, &res.n_ctx_max, log_level);
+    }
+
+    // min: the smallest context --fit may pick (--fit only changes n_ctx when it is 0)
+    uint32_t n_ctx_min = cparams.n_ctx;
+    if (n_ctx_min == 0 && params.fit_params) {
+        const uint32_t n_streams = cparams.kv_unified ? 1 : std::max<uint32_t>(1, cparams.n_seq_max);
+        // -c 0 sets fit_params_min_ctx to UINT32_MAX, cap at n_ctx_train like --fit
+        n_ctx_min = (uint32_t) std::min<uint64_t>(
+            uint64_t(params.fit_params_min_ctx) * n_streams,
+            uint64_t(res.n_ctx_train) * n_streams);
+    }
+    if (n_ctx_min == 0 || n_ctx_min >= res.n_ctx_max) {
+        // nothing to reduce, or -fit off with the trained context
+        res.n_ctx_min = res.n_ctx_max;
+        res.info_min  = res.info_max;
+    } else {
+        cparams.n_ctx = n_ctx_min;
+        res.info_min  = common_fit_measure(paths_model, &mparams, &cparams, nullptr, &res.n_ctx_min, log_level);
+    }
+
+    return res;
+}
+
 common_device_memory_data_vec common_get_device_memory_data(
-        const char * path_model,
+        const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
+        uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            paths_model, mparams, cparams, devs, hp_ngl, hp_ngl_skip, hp_n_ctx_train, hp_n_expert, log_level);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -176,10 +292,72 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// drafts that borrow token_embd/output from their target (DFlash, DSpark, Eagle3) cannot create a context on their
+// own: while measuring such a draft, give it an allocation-free target context as ctx_other (its memory is counted with
+// the main model, not here) and the backend top-k samplers the speculative decoder installs on the draft
+struct common_fit_draft_target {
+    llama_context_params * cparams_dft;
+    llama_context_params   cparams_dft_orig;
+    llama_model   * model = nullptr;
+    llama_context * ctx   = nullptr;
+    std::vector<llama_sampler *>         chains;
+    std::vector<llama_sampler_seq_config> configs;
+
+    common_fit_draft_target(const std::vector<std::string> & paths_model, const llama_model_params * mparams, const llama_context_params * cparams,
+            llama_context_params * cparams_dft, bool backend_sampling, ggml_log_level log_level)
+        : cparams_dft(cparams_dft), cparams_dft_orig(*cparams_dft) {
+        struct user_data_t {
+            ggml_log_callback callback;
+            void * user_data;
+            ggml_log_level min_level;
+        } ud;
+        llama_log_get(&ud.callback, &ud.user_data);
+        ud.min_level = log_level;
+        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+            const user_data_t * ud = (const user_data_t *) user_data;
+            ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+        }, &ud);
+
+        llama_model_params mparams_copy = *mparams;
+        mparams_copy.no_alloc  = true;
+        mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+        model = common_model_load(paths_model, mparams_copy);
+        if (model != nullptr) {
+            ctx = llama_init_from_model(model, *cparams);
+        }
+        llama_log_set(ud.callback, ud.user_data);
+        if (ctx == nullptr) {
+            return; // the draft is measured on its own, as before
+        }
+
+        cparams_dft->ctx_other = ctx;
+        if (backend_sampling && cparams_dft->n_samplers == 0) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) std::max<uint32_t>(1, cparams_dft->n_seq_max); ++seq_id) {
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                chains.push_back(chain);
+                configs.push_back({ seq_id, chain });
+            }
+            cparams_dft->samplers   = configs.data();
+            cparams_dft->n_samplers = configs.size();
+        }
+    }
+
+    ~common_fit_draft_target() {
+        *cparams_dft = cparams_dft_orig;
+        for (llama_sampler * chain : chains) {
+            llama_sampler_free(chain);
+        }
+        llama_free(ctx);
+        llama_model_free(model);
+    }
+};
+
 static void common_params_fit_impl(
-        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+        const std::vector<std::string> & paths_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, bool moe_cache_auto,
+        enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -189,6 +367,7 @@ static void common_params_fit_impl(
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
@@ -197,19 +376,38 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    dmds_t      dmds_extra;       // memory of the extra model, laid out on the devices of the main model
+    uint32_t    n_ctx_extra = 0;  // context that memory was measured at
+    std::string placement_extra;  // main model placement that memory was measured at, for a shared model
+
+    // a context that shares the main model runs on its weights wherever the fit puts them,
+    // so its memory follows the placement of the main model as well as the context size
+    auto placement_key = [&](const llama_model_params * mp) {
+        std::string key = std::to_string(mp->n_gpu_layers);
+        for (const llama_model_tensor_buft_override * o = mp->tensor_buft_overrides; o && o->pattern; o++) {
+            key += std::string("|") + o->pattern + "=" + (o->buft ? ggml_backend_buft_name(o->buft) : "");
+        }
+        if (mp->tensor_split) {
+            for (size_t id = 0; id < devs.size(); id++) {
+                key += "|" + std::to_string(mp->tensor_split[id]);
+            }
+        }
+        return key;
+    };
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
-    auto add_extra_memory = [&](dmds_t & dmds) {
+    // mp is the main model placement the memory in dmds was measured at
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * mp) {
         if (extra == nullptr) {
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        const std::string placement = extra->shares_model ? placement_key(mp) : std::string();
+        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx || placement_extra != placement) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
+            uint32_t nsk_extra = 0;
             uint32_t nct_extra = 0;
             uint32_t nex_extra = 0;
 
@@ -218,15 +416,23 @@ static void common_params_fit_impl(
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
 
+            std::unique_ptr<common_fit_draft_target> draft_target;
+            if (!extra->shares_model) {
+                draft_target.reset(new common_fit_draft_target(
+                    paths_model, mparams, cparams, extra->cparams, extra->backend_sampling, log_level));
+            }
+
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->paths_model, extra->shares_model ? mp : extra->mparams, extra->cparams,
+                    devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
+                n_ctx_extra     = cparams->n_ctx;
+                placement_extra = placement;
                 return;
             }
 
@@ -248,7 +454,8 @@ static void common_params_fit_impl(
                 }
             }
 
-            n_ctx_extra = cparams->n_ctx;
+            n_ctx_extra     = cparams->n_ctx;
+            placement_extra = placement;
         }
 
         for (size_t id = 0; id < dmds.size(); id++) {
@@ -261,7 +468,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -273,12 +480,17 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
         }
     }
-    add_extra_memory(dmds_full);
+    add_extra_memory(dmds_full, mparams);
 
     const size_t nd = devs.size(); // number of devices
+
+    if (moe_cache_auto && (hp_nex == 0 || nd != 1)) {
+        LOG_WRN("%s: --moe-cache-mib auto needs a MoE model on a single GPU, not using a MoE cache\n", __func__);
+        moe_cache_auto = false;
+    }
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -412,8 +624,8 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                    add_extra_memory(dmds_min_ctx);
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+                    add_extra_memory(dmds_min_ctx, mparams);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -559,6 +771,20 @@ static void common_params_fit_impl(
         assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
         uint32_t il0 = hp_ngl + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
 
+        // the skipped NextN layers come right before the output layer, put them on the same device as the output layer
+        // so that the layers assigned by the model loader match the layers above
+        if (hp_nsk > 0 && mparams.n_gpu_layers > 0) {
+            mparams.n_gpu_layers += hp_nsk;
+            if (nd > 1) {
+                // the last devices have no layers if not even the output layer fits
+                size_t id_last = nd - 1;
+                while (ngl_per_device[id_last].n_layer == 0) {
+                    id_last--;
+                }
+                tensor_split[id_last] += hp_nsk;
+            }
+        }
+
         mparams.tensor_split = tensor_split;
 
         size_t itbo = 0;
@@ -594,8 +820,8 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmd_nl);
+            paths_model, &mparams_copy, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmd_nl, &mparams_copy);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -613,9 +839,12 @@ static void common_params_fit_impl(
         return ret;
     };
 
+    const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
     int64_t global_surplus_cpu_moe = 0;
+    int64_t mem_cpu_moe            = 0; // memory use of device 0 with all MoE tensors in system memory
+    int64_t mem_cpu_moe_model      = 0; // model memory of device 0 with all MoE tensors in system memory
+    size_t  moe_cache_min_size     = 0;
     if (hp_nex > 0) {
-        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
         tensor_buft_overrides[1] = {nullptr, nullptr};
@@ -623,8 +852,10 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmds_cpu_moe);
+            paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level, moe_cache_auto ? &moe_cache_min_size : nullptr);
+        add_extra_memory(dmds_cpu_moe, mparams);
+        mem_cpu_moe       = dmds_cpu_moe[0].mb.total();
+        mem_cpu_moe_model = dmds_cpu_moe[0].mb.model;
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -642,6 +873,73 @@ static void common_params_fit_impl(
         // reset
         tensor_buft_overrides[0] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
+    }
+
+    // MoE cache: every routed expert stays in system memory and the device memory that is left over caches the used ones
+    // all sizes are relative to the free memory measured at the start, as for the layers below
+    //
+    // the cache gets the same device memory the layer split below would spend on resident expert layers, so when that
+    // memory already holds most of the experts the split wins: its resident layers cost nothing per token, while the
+    // cache pays an upload for every miss
+    const int64_t target_moe     = dmds_full[0].free - margins[0];
+    // compare model memory only: dmds_full can be measured at a larger context than the one the fit settled on
+    const int64_t mem_experts    = int64_t(dmds_full[0].mb.model) - mem_cpu_moe_model;
+    const double  frac_resident  = mem_experts > 0 ? double(target_moe - mem_cpu_moe) / double(mem_experts) : 1.0;
+    if (moe_cache_auto && global_surplus_cpu_moe > 0 && frac_resident >= MOE_CACHE_AUTO_MAX_RESIDENT) {
+        LOG_INF("%s: moe cache auto: the layer split keeps %.0f%% of the expert weights in device memory, not using a MoE cache\n",
+            __func__, 100.0*frac_resident);
+    } else if (moe_cache_auto && global_surplus_cpu_moe > 0) {
+        const int64_t target = target_moe;
+
+        // on any error, do not load the model with a partially applied MoE cache
+        struct rollback_t {
+            llama_model_params               * mparams;
+            llama_context_params             * cparams;
+            llama_model_tensor_buft_override * tbo;
+            bool active = true;
+            ~rollback_t() {
+                if (active) {
+                    cparams->moe_cache_size = 0;
+                    tbo[0] = {nullptr, nullptr};
+                    mparams->tensor_buft_overrides = tbo;
+                }
+            }
+        } rollback = {mparams, cparams, tensor_buft_overrides};
+
+        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), ggml_backend_cpu_buffer_type()};
+        tensor_buft_overrides[1] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        // a cache with the slots for the experts of only one token thrashes and is slower than no cache
+        const int64_t cache_min = 2*int64_t(moe_cache_min_size);
+        int64_t cache = target - mem_cpu_moe;
+        cache -= cache % MiB;
+        int64_t cache_tested = cache; // last size that was measured, for the log
+        bool fits = false;
+        for (int i = 0; i < 4 && cache_min > 0 && cache >= cache_min; i++) {
+            cparams->moe_cache_size = cache;
+            cache_tested = cache;
+            LOG_TRC("%s: getting device memory data with a MoE cache of %" PRId64 " MiB:\n", __func__, cache/MiB);
+            dmds_t dmds = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds, mparams);
+            const int64_t overshoot = int64_t(dmds[0].mb.total()) - target;
+            if (overshoot <= 0) {
+                fits = true;
+                break;
+            }
+            cache -= GGML_PAD(overshoot, MiB);
+        }
+        if (fits) {
+            rollback.active = false;
+            LOG_INF("%s: moe cache auto: all routed experts in host RAM, cache %" PRId64 " MiB (margin %" PRId64 " MiB)\n",
+                __func__, cache/MiB, margins[0]/MiB);
+            return;
+        }
+
+        LOG_INF("%s: moe cache auto: cache of %" PRId64 " MiB does not fit or is below the minimum of %" PRId64 " MiB, not using a MoE cache\n",
+            __func__, std::max<int64_t>(cache_tested, 0)/MiB, cache_min/MiB);
+    } else if (moe_cache_auto) {
+        LOG_INF("%s: moe cache auto: the dense weights do not fit, not using a MoE cache\n", __func__);
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -877,7 +1175,7 @@ static void common_params_fit_impl(
 }
 
 enum common_params_fit_status common_fit_params(
-        const char * path_model,
+        const std::vector<std::string> & paths_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
         float * tensor_split,
@@ -885,11 +1183,12 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
+        bool moe_cache_auto,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, moe_cache_auto, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
@@ -903,8 +1202,7 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
-void common_memory_breakdown_print(const struct llama_context * ctx) {
-    //const auto & devices = ctx->get_model().devices;
+std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const struct llama_context * ctx) {
     const auto * model = llama_get_model(ctx);
 
     std::vector<ggml_backend_dev_t> devices;
@@ -914,18 +1212,6 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
-    std::vector<std::array<std::string, 9>> table_data;
-    table_data.reserve(devices.size());
-
-    // same data as the table below, for --log-jsonl consumers
-    common_json rows = common_json::array();
-    const std::string template_header = "%s: | %s | %s   %s    %s   %s   %s   %s    %s |\n";
-    const std::string template_gpu    = "%s: | %s | %s = %s + (%s = %s + %s + %s) + %s |\n";
-    const std::string template_other  = "%s: | %s | %s   %s    %s = %s + %s + %s    %s |\n";
-
-    table_data.push_back({template_header, "memory breakdown [MiB]", "total", "free", "self", "model", "context", "compute", "unaccounted"});
-
-    constexpr size_t MiB = 1024 * 1024;
     const std::vector<std::string> desc_prefixes_strip = {"NVIDIA ", "GeForce ", "Tesla ", "AMD ", "Radeon ", "Instinct "};
 
     // track seen buffer types to avoid double counting:
@@ -964,104 +1250,130 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         }
     }
 
-    // print memory breakdown for each device:
+    std::vector<common_memory_breakdown_row> rows;
+    rows.reserve(devices.size() + 1 + memory_breakdown.size());
+
     for (size_t i = 0; i < devices.size(); i++) {
         ggml_backend_dev_t dev = devices[i];
-        llama_memory_breakdown_data mb = mb_dev[i];
 
-        const std::string name = ggml_backend_dev_name(dev);
-        std::string desc = ggml_backend_dev_description(dev);
+        common_memory_breakdown_row row;
+        row.kind        = common_memory_breakdown_row::DEVICE;
+        row.name        = ggml_backend_dev_name(dev);
+        row.description = ggml_backend_dev_description(dev);
         for (const std::string & prefix : desc_prefixes_strip) {
-            if (desc.length() >= prefix.length() && desc.substr(0, prefix.length()) == prefix) {
-                desc = desc.substr(prefix.length());
+            if (row.description.length() >= prefix.length() && row.description.substr(0, prefix.length()) == prefix) {
+                row.description = row.description.substr(prefix.length());
             }
         }
 
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-
-        const size_t self = mb.model + mb.context + mb.compute;
-        const int64_t unaccounted = static_cast<int64_t>(total) - static_cast<int64_t>(free) - static_cast<int64_t>(self);
-
-        table_data.push_back({
-            template_gpu,
-            "  - " + name + " (" + desc + ")",
-            std::to_string(total / MiB),
-            std::to_string(free / MiB),
-            std::to_string(self / MiB),
-            std::to_string(mb.model / MiB),
-            std::to_string(mb.context / MiB),
-            std::to_string(mb.compute / MiB),
-            std::to_string(unaccounted / static_cast<int64_t>(MiB))});
-
-        rows.push_back({
-            {"kind",        "device"},
-            {"name",        name},
-            {"description", desc},
-            {"total",       total / MiB},
-            {"free",        free / MiB},
-            {"self",        self / MiB},
-            {"model",       mb.model / MiB},
-            {"context",     mb.context / MiB},
-            {"compute",     mb.compute / MiB},
-            {"unaccounted", unaccounted / static_cast<int64_t>(MiB)},
-        });
+        row.total   = total;
+        row.free    = free;
+        row.model   = mb_dev[i].model;
+        row.context = mb_dev[i].context;
+        row.compute = mb_dev[i].compute;
+        rows.push_back(std::move(row));
     }
 
-    // print memory breakdown for host:
     {
-        const size_t self = mb_host.model + mb_host.context + mb_host.compute;
-        table_data.push_back({
-            template_other,
-            "  - Host",
-            "", // total
-            "", // free
-            std::to_string(self / MiB),
-            std::to_string(mb_host.model / MiB),
-            std::to_string(mb_host.context / MiB),
-            std::to_string(mb_host.compute / MiB),
-            ""}); // unaccounted
-
-        rows.push_back({
-            {"kind",    "host"},
-            {"name",    "Host"},
-            {"self",    self / MiB},
-            {"model",   mb_host.model / MiB},
-            {"context", mb_host.context / MiB},
-            {"compute", mb_host.compute / MiB},
-        });
+        common_memory_breakdown_row row;
+        row.kind    = common_memory_breakdown_row::HOST;
+        row.name    = "Host";
+        row.model   = mb_host.model;
+        row.context = mb_host.context;
+        row.compute = mb_host.compute;
+        rows.push_back(std::move(row));
     }
 
-    // print memory breakdown for all remaining buffer types:
+    // all remaining buffer types:
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
         if (seen_buffer_types.count(buft) == 1) {
             continue;
         }
-        const std::string name = ggml_backend_buft_name(buft);
-        const size_t self = mb.model + mb.context + mb.compute;
+        common_memory_breakdown_row row;
+        row.kind    = common_memory_breakdown_row::BUFFER_TYPE;
+        row.name    = ggml_backend_buft_name(buft);
+        row.model   = mb.model;
+        row.context = mb.context;
+        row.compute = mb.compute;
+        rows.push_back(std::move(row));
+
+        seen_buffer_types.insert(buft);
+    }
+
+    return rows;
+}
+
+void common_memory_breakdown_print(const struct llama_context * ctx) {
+    const std::vector<common_memory_breakdown_row> rows = common_memory_breakdown_rows(ctx);
+
+    std::vector<std::array<std::string, 9>> table_data;
+    table_data.reserve(rows.size() + 1);
+
+    // same data as the table below, for --log-jsonl consumers
+    common_json json_rows = common_json::array();
+    const std::string template_header = "%s: | %s | %s   %s    %s   %s   %s   %s    %s |\n";
+    const std::string template_gpu    = "%s: | %s | %s = %s + (%s = %s + %s + %s) + %s |\n";
+    const std::string template_other  = "%s: | %s | %s   %s    %s = %s + %s + %s    %s |\n";
+
+    table_data.push_back({template_header, "memory breakdown [MiB]", "total", "free", "self", "model", "context", "compute", "unaccounted"});
+
+    constexpr size_t MiB = 1024 * 1024;
+
+    for (const auto & row : rows) {
+        const size_t self = row.model + row.context + row.compute;
+
+        if (row.kind == common_memory_breakdown_row::DEVICE) {
+            const int64_t unaccounted = row.total - row.free - static_cast<int64_t>(self);
+
+            table_data.push_back({
+                template_gpu,
+                "  - " + row.name + " (" + row.description + ")",
+                std::to_string(row.total / MiB),
+                std::to_string(row.free / MiB),
+                std::to_string(self / MiB),
+                std::to_string(row.model / MiB),
+                std::to_string(row.context / MiB),
+                std::to_string(row.compute / MiB),
+                std::to_string(unaccounted / static_cast<int64_t>(MiB))});
+
+            json_rows.push_back({
+                {"kind",        "device"},
+                {"name",        row.name},
+                {"description", row.description},
+                {"total",       row.total / MiB},
+                {"free",        row.free / MiB},
+                {"self",        self / MiB},
+                {"model",       row.model / MiB},
+                {"context",     row.context / MiB},
+                {"compute",     row.compute / MiB},
+                {"unaccounted", unaccounted / static_cast<int64_t>(MiB)},
+            });
+            continue;
+        }
+
         table_data.push_back({
             template_other,
-            "  - " + name,
+            "  - " + row.name,
             "", // total
             "", // free
             std::to_string(self / MiB),
-            std::to_string(mb.model / MiB),
-            std::to_string(mb.context / MiB),
-            std::to_string(mb.compute / MiB),
+            std::to_string(row.model / MiB),
+            std::to_string(row.context / MiB),
+            std::to_string(row.compute / MiB),
             ""}); // unaccounted
 
-        rows.push_back({
-            {"kind",    "buffer_type"},
-            {"name",    name},
+        json_rows.push_back({
+            {"kind",    row.kind == common_memory_breakdown_row::HOST ? "host" : "buffer_type"},
+            {"name",    row.name},
             {"self",    self / MiB},
-            {"model",   mb.model / MiB},
-            {"context", mb.context / MiB},
-            {"compute", mb.compute / MiB},
+            {"model",   row.model / MiB},
+            {"context", row.context / MiB},
+            {"compute", row.compute / MiB},
         });
-
-        seen_buffer_types.insert(buft);
     }
 
     for (size_t j = 1; j < table_data[0].size(); j++) {
@@ -1081,20 +1393,21 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 
     LOG_JSON("fit_memory_breakdown", common_json({
         {"unit", "MiB"},
-        {"rows", rows},
+        {"rows", json_rows},
     }));
 }
 
 void common_fit_print(
-        const char * path_model,
+        const std::vector<std::string> & paths_model,
         llama_model_params * mparams,
         llama_context_params * cparams) {
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {

@@ -45,6 +45,9 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "IQ2_M",    LLAMA_FTYPE_MOSTLY_IQ2_M,    " 2.7  bpw quantization",            },
     { "IQ1_S",    LLAMA_FTYPE_MOSTLY_IQ1_S,    " 1.56 bpw quantization",            },
     { "IQ1_M",    LLAMA_FTYPE_MOSTLY_IQ1_M,    " 1.75 bpw quantization",            },
+    { "IQ1_XS",   LLAMA_FTYPE_MOSTLY_IQ1_XS,   " 1.44 bpw quantization",            },
+    { "IQ1_XXS",  LLAMA_FTYPE_MOSTLY_IQ1_XXS,  " 1.31 bpw quantization",            },
+    { "IQ1_XXXS", LLAMA_FTYPE_MOSTLY_IQ1_XXXS, " 1.19 bpw quantization",            },
     { "TQ1_0",    LLAMA_FTYPE_MOSTLY_TQ1_0,    " 1.69 bpw ternarization",           },
     { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
@@ -510,7 +513,8 @@ int llama_quantize(int argc, char ** argv) {
             llama_model_kv_override kvo;
             std::strcpy(kvo.key, LLM_KV_QUANTIZE_IMATRIX_FILE);
             kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
-            strncpy(kvo.val_str, imatrix_file.c_str(), 127);
+            const std::string fname_imatrix = std::filesystem::path(imatrix_file).filename().string();
+            strncpy(kvo.val_str, fname_imatrix.c_str(), 127);
             kvo.val_str[127] = '\0';
             kv_overrides.emplace_back(std::move(kvo));
         }
@@ -519,7 +523,8 @@ int llama_quantize(int argc, char ** argv) {
             // TODO: list multiple datasets when there are more than one
             std::strcpy(kvo.key, LLM_KV_QUANTIZE_IMATRIX_DATASET);
             kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
-            strncpy(kvo.val_str, imatrix_datasets[0].c_str(), 127);
+            const std::string fname_dataset = std::filesystem::path(imatrix_datasets[0]).filename().string();
+            strncpy(kvo.val_str, fname_dataset.c_str(), 127);
             kvo.val_str[127] = '\0';
             kv_overrides.emplace_back(std::move(kvo));
         }

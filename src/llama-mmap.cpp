@@ -5,11 +5,11 @@
 #include "ggml.h"
 
 #include <cstring>
-#include <climits>
 #include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <string>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -30,10 +30,8 @@
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif
+    #include <malloc.h>
     #include <windows.h>
-    #ifndef PATH_MAX
-        #define PATH_MAX MAX_PATH
-    #endif
     #include <io.h>
 #endif
 
@@ -68,7 +66,10 @@ static std::string llama_format_win_err(DWORD err) {
 
 struct llama_file::impl {
 #if defined(_WIN32)
-    HANDLE fp_win32;
+    // Keep the buffered handle as the logical cursor; the direct handle only issues aligned I/O.
+    HANDLE fp_win32        = INVALID_HANDLE_VALUE;
+    HANDLE fp_win32_direct = INVALID_HANDLE_VALUE;
+
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -81,13 +82,93 @@ struct llama_file::impl {
             LocalFree(lpMsgBuf);
         }
 
+        while (!ret.empty() && (ret.back() == '\r' || ret.back() == '\n')) {
+            ret.pop_back();
+        }
+
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
-        fp = ggml_fopen(fname, mode);
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname) {
+        init_buffered_io(mode);
+        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
+            DWORD error = ERROR_SUCCESS;
+            if (!init_direct_io(error)) {
+                LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
+                               fname, GetErrorMessageWin32(error).c_str());
+            }
+        }
+    }
+
+    bool init_direct_io(DWORD& error) {
+        error = ERROR_SUCCESS;
+        alignment = 1;
+
+        fp_win32_direct = ReOpenFile(
+            fp_win32,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_NO_BUFFERING);
+
+        if (fp_win32_direct == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            return false;
+        }
+
+        const bool ok = [&]() -> bool {
+#if defined(NTDDI_VERSION) && defined(NTDDI_WIN8) && (NTDDI_VERSION >= NTDDI_WIN8)
+            FILE_STORAGE_INFO storage_info{};
+            if (!GetFileInformationByHandleEx(
+                    fp_win32_direct,
+                    FileStorageInfo,
+                    &storage_info,
+                    static_cast<DWORD>(sizeof(storage_info)))) {
+                error = GetLastError();
+                return false;
+            }
+
+            alignment = std::max<size_t>({
+                static_cast<size_t>(storage_info.LogicalBytesPerSector),
+                static_cast<size_t>(storage_info.PhysicalBytesPerSectorForAtomicity),
+                static_cast<size_t>(storage_info.PhysicalBytesPerSectorForPerformance),
+                static_cast<size_t>(storage_info.FileSystemEffectivePhysicalBytesPerSectorForAtomicity)
+            });
+#else
+            error = ERROR_NOT_SUPPORTED;
+            return false;
+#endif
+            // Required for bit-mask rounding and aligned allocation schemes.
+            if (alignment <= 1 || (alignment & (alignment - 1)) != 0) {
+                error = ERROR_NOT_SUPPORTED;
+                return false;
+            }
+
+            // ReOpenFile creates a distinct handle; explicitly start direct I/O at offset 0.
+            LARGE_INTEGER zero{};
+            if (!SetFilePointerEx(fp_win32_direct, zero, nullptr, FILE_BEGIN)) {
+                error = GetLastError();
+                return false;
+            }
+
+            return true;
+        }();
+
+        if (!ok) {
+            CloseHandle(fp_win32_direct);
+            fp_win32_direct = INVALID_HANDLE_VALUE;
+            alignment = 1;
+            return false;
+        }
+
+        LLAMA_LOG_INFO("%s: file '%s' opened with unbuffered I/O (alignment: %zu bytes)\n",
+                       __func__, fname.c_str(), alignment);
+        return true;
+    }
+
+    void init_buffered_io(const char * mode) {
+        fp = ggml_fopen(fname.c_str(), mode);
         if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
         }
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -95,7 +176,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -108,7 +189,7 @@ struct llama_file::impl {
         li.QuadPart = 0;
         BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
         if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            throw std::runtime_error(format("tell error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
         }
 
         return li.QuadPart;
@@ -123,24 +204,159 @@ struct llama_file::impl {
         li.QuadPart = offset;
         BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
         if (!ret) {
-            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            throw std::runtime_error(format("seek error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
         }
     }
 
-    void read_raw(void * ptr, size_t len) {
-        size_t bytes_read = 0;
-        while (bytes_read < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
-            DWORD chunk_read = 0;
-            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
-            if (!result) {
-                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+    void read_raw_unsafe(void * ptr, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t read_offset = tell();
+        if (read_offset > size) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        if (!has_direct_io()) {
+            const size_t read_size = std::min(len, size - read_offset);
+            size_t bytes_read = 0;
+            while (bytes_read < read_size) {
+                const DWORD to_read = (DWORD) std::min<size_t>(read_size - bytes_read, MAXDWORD);
+                DWORD chunk_read = 0;
+                BOOL result = ReadFile(fp_win32, reinterpret_cast<char *>(ptr) + bytes_read,
+                                       to_read, &chunk_read, NULL);
+                if (!result) {
+                    throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+                }
+                if (chunk_read < to_read) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+
+                bytes_read += chunk_read;
             }
-            if (chunk_read < chunk_size || chunk_read == 0) {
-                throw std::runtime_error("unexpectedly reached end of file");
+            return;
+        }
+
+        DWORD error = ERROR_SUCCESS;
+        if ((read_offset & (alignment - 1)) != 0 ||
+            (len & (alignment - 1)) != 0 ||
+            (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) != 0) {
+            error = ERROR_INVALID_PARAMETER;
+        } else {
+            LARGE_INTEGER li;
+            li.QuadPart = read_offset;
+            if (!SetFilePointerEx(fp_win32_direct, li, NULL, FILE_BEGIN)) {
+                error = GetLastError();
+            }
+        }
+
+        size_t bytes_read = 0;
+        const size_t max_read_size = (size_t) MAXDWORD & ~(alignment - 1);
+        while (error == ERROR_SUCCESS && bytes_read < len) {
+            const DWORD to_read = (DWORD) std::min(len - bytes_read, max_read_size);
+            DWORD chunk_read = 0;
+            BOOL result = ReadFile(fp_win32_direct, reinterpret_cast<char *>(ptr) + bytes_read,
+                                   to_read, &chunk_read, NULL);
+            if (!result) {
+                error = GetLastError();
+                if (error == ERROR_HANDLE_EOF && bytes_read == size - read_offset) {
+                    error = ERROR_SUCCESS;
+                    break;
+                }
+                break;
             }
 
             bytes_read += chunk_read;
+            if (chunk_read < to_read) {
+                if (bytes_read == size - read_offset) {
+                    break;
+                }
+                error = ERROR_HANDLE_EOF;
+            }
+        }
+
+        if (error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_USER_BUFFER || error == ERROR_NOACCESS) {
+            LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
+                           __func__, fname.c_str(), GetErrorMessageWin32(error).c_str());
+            CloseHandle(fp_win32_direct);
+            fp_win32_direct = INVALID_HANDLE_VALUE;
+            alignment = 1;
+            seek(read_offset, SEEK_SET);
+            read_raw_unsafe(ptr, len);
+            return;
+        }
+        if (error != ERROR_SUCCESS) {
+            throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(error).c_str()));
+        }
+
+        seek(len > size - read_offset ? size : read_offset + len, SEEK_SET);
+    }
+
+    void read_aligned_chunk(void * dest, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset = tell();
+        if (offset > size || len > size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        const size_t aligned_offset = offset & ~(alignment - 1);
+        const size_t offset_from_alignment = offset - aligned_offset;
+        const size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+        const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
+
+        struct aligned_buffer_deleter {
+            void operator()(void * p) const { _aligned_free(p); }
+        };
+        std::unique_ptr<void, aligned_buffer_deleter> buffer(_aligned_malloc(buffer_size, alignment));
+        if (!buffer) {
+            LLAMA_LOG_WARN("%s: Falling back to buffered I/O due to %s\n",
+                           __func__, GetErrorMessageWin32(ERROR_NOT_ENOUGH_MEMORY).c_str());
+            CloseHandle(fp_win32_direct);
+            fp_win32_direct = INVALID_HANDLE_VALUE;
+            alignment = 1;
+            seek(offset, SEEK_SET);
+            read_raw_unsafe(dest, len);
+            return;
+        }
+
+        seek(aligned_offset, SEEK_SET);
+
+        size_t skip   = offset_from_alignment;
+        size_t copied = 0;
+        for (size_t done = 0; done < bytes_to_read; ) {
+            const size_t n = std::min(buffer_size, bytes_to_read - done);
+            read_raw_unsafe(buffer.get(), n);
+
+            const size_t chunk_skip = std::min(skip, n);
+            const size_t count = std::min(n - chunk_skip, len - copied);
+            memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + chunk_skip, count);
+
+            copied += count;
+            skip   -= chunk_skip;
+            done   += n;
+        }
+
+        seek(offset + len, SEEK_SET);
+    }
+
+    void read_raw(void * ptr, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset = tell();
+        if (offset > size || len > size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        if (has_direct_io()) {
+            read_aligned_chunk(ptr, len);
+        } else {
+            read_raw_unsafe(ptr, len);
         }
     }
 
@@ -153,7 +369,7 @@ struct llama_file::impl {
     void write_raw(const void * ptr, size_t len) const {
         size_t bytes_written = 0;
         while (bytes_written < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
+            size_t chunk_size = std::min<size_t>(len - bytes_written, LLAMA_DIRECT_IO_BUFFER_SIZE);
             DWORD chunk_written = 0;
             BOOL result = WriteFile(fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size, &chunk_written, NULL);
             if (!result) {
@@ -172,23 +388,29 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        return fp_win32_direct != INVALID_HANDLE_VALUE && alignment > 1;
     }
 
     ~impl() {
+        if (fp_win32_direct != INVALID_HANDLE_VALUE) {
+            CloseHandle(fp_win32_direct);
+        }
         if (fp && owns_fp) {
             std::fclose(fp);
         }
     }
+    std::string fname;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
+                LLAMA_LOG_INFO("%s: file '%s' opened with direct I/O (alignment: %zu bytes)\n",
+                               __func__, fname, alignment);
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
+            LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
                            fname, strerror(errno));
         }
 #endif
@@ -268,8 +490,8 @@ struct llama_file::impl {
         }
         errno = 0;
         if (fd == -1) {
-            const size_t curr_off = tell();
-            const size_t to_read = std::min(len, size - curr_off);
+            const size_t read_offset = tell();
+            const size_t to_read = std::min(len, size - read_offset);
 
             std::size_t ret = std::fread(ptr, to_read, 1, fp);
             if (ferror(fp)) {
@@ -286,24 +508,23 @@ struct llama_file::impl {
 
                 if (ret == -1) {
                     if (errno == EINTR) {
-                        continue;  // Interrupted by signal, retry
+                        continue;
                     }
-                    // Fallback to std::fread in case the DMA controller cannot access the buffer
-                    if (errno == EFAULT || errno == EINVAL) {
-                        LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
-                        auto curr_off = tell();
+                    if (errno == EFAULT || errno == EINVAL || errno == EIO) {
+                        LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
+                                       __func__, fname.c_str(), strerror(errno));
+                        const size_t read_offset = tell();
                         close(fd);
                         fd = -1;
                         alignment = 1;
                         init_fp("rb");
-                        seek(curr_off, SEEK_SET);
-                        read_raw_unsafe(ptr, len);
+                        seek(read_offset, SEEK_SET);
+                        read_raw_unsafe(static_cast<char *>(ptr) + bytes_read, to_read);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
                 }
                 if (ret == 0) {
-                    // EOF: allow if this read was only pulling alignment padding past file end
                     off_t pos = lseek(fd, 0, SEEK_CUR);
                     if (pos != -1 && (size_t) pos == size) {
                         std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
@@ -317,11 +538,11 @@ struct llama_file::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
+    void read_aligned_chunk(void * dest, size_t len) {
         size_t offset = tell();
         off_t aligned_offset = offset & ~(alignment - 1);
         off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+        size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
 
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
@@ -329,7 +550,15 @@ struct llama_file::impl {
         void * raw_buffer = nullptr;
         int ret = posix_memalign(&raw_buffer, alignment, buffer_size);
         if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+            LLAMA_LOG_WARN("%s: file '%s' falling back to buffered I/O due to %s\n",
+                           __func__, fname.c_str(), strerror(ret));
+            close(fd);
+            fd = -1;
+            alignment = 1;
+            init_fp("rb");
+            seek(offset, SEEK_SET);
+            read_raw_unsafe(dest, len);
+            return;
         }
 
         struct aligned_buffer_deleter {
@@ -345,13 +574,15 @@ struct llama_file::impl {
             const size_t n = std::min(buffer_size, bytes_to_read - done);
             read_raw_unsafe(buffer.get(), n);
 
-            const size_t count = std::min(n - skip, size - copied);
+            const size_t count = std::min(n - skip, len - copied);
             memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
 
             copied += count;
             skip    = 0;
             done   += n;
         }
+
+        seek(offset + len, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -390,7 +621,7 @@ struct llama_file::impl {
     ~impl() {
         if (fd != -1) {
             close(fd);
-        } else if (owns_fp) {
+        } else if (fp && owns_fp) {
             std::fclose(fp);
         }
     }
@@ -439,11 +670,7 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
-#endif
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
@@ -526,6 +753,24 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+    }
+
+    size_t populate(const llama_mmap::ranges & rs) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+        size_t n = 0;
+        for (const auto & run : llama_mmap::page_runs(rs, size, sysconf(_SC_PAGESIZE))) {
+            if (madvise((char *) addr + run.first, run.second - run.first, MADV_POPULATE_READ)) {
+                // EINVAL before Linux 5.14: the pages fault in on demand instead
+                LLAMA_LOG_DEBUG("%s: madvise(.., MADV_POPULATE_READ) failed: %s\n", __func__, strerror(errno));
+                break;
+            }
+            n += run.second - run.first;
+        }
+        return n;
+#else
+        GGML_UNUSED(rs);
+        return 0;
+#endif
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -636,8 +881,27 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // A view cannot be partially unmapped, but VirtualUnlock on pages that are not locked
+        // drops them from the working set (failing with ERROR_NOT_LOCKED), as munmap does for RSS.
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = si.dwPageSize;
+        first = (first + page_size - 1) & ~(page_size - 1);
+        last  = std::min(last, size) & ~(page_size - 1);
+        if (last <= first) {
+            return;
+        }
+        if (!VirtualUnlock((char *) addr + first, last - first)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_LOCKED) {
+                LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(error).c_str());
+            }
+        }
+    }
+
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+        return 0;
     }
 
     ~impl() {
@@ -670,6 +934,12 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    size_t populate(const llama_mmap::ranges & rs) {
+        GGML_UNUSED(rs);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -684,6 +954,148 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+size_t llama_mmap::populate(const ranges & rs) { return pimpl->populate(rs); }
+
+llama_mmap::ranges llama_mmap::page_runs(ranges rs, size_t limit, size_t page_size) {
+    rs.erase(std::remove_if(rs.begin(), rs.end(), [](const auto & r) { return r.first >= r.second; }), rs.end());
+    for (auto & r : rs) {
+        r.first  = r.first & ~(page_size - 1);
+        r.second = std::min((r.second + page_size - 1) & ~(page_size - 1), limit);
+    }
+    std::sort(rs.begin(), rs.end());
+
+    ranges res;
+    for (const auto & r : rs) {
+        if (r.first >= r.second) {
+            continue;
+        }
+        if (!res.empty() && r.first <= res.back().second) {
+            res.back().second = std::max(res.back().second, r.second);
+        } else {
+            res.push_back(r);
+        }
+    }
+
+    return res;
+}
+
+#ifdef __linux__
+// the number at the start of path, false if missing, unreadable or not a number ("max")
+static bool llama_read_u64(const std::string & path, unsigned long long & v) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fscanf(f, "%llu", &v) == 1;
+    fclose(f);
+    return ok;
+}
+
+// mountinfo octal-escapes space, tab, newline and backslash in its path fields (a systemd "\x2d" name included)
+static std::string llama_mountinfo_unescape(const char * s) {
+    std::string res;
+    for (; *s; s++) {
+        if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' && s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+            const char c = (char) ((s[1] - '0')*64 + (s[2] - '0')*8 + (s[3] - '0'));
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\\') {
+                res += c;
+                s += 3;
+                continue;
+            }
+        }
+        res += *s;
+    }
+    return res;
+}
+
+// a cgroup mount whose root is a subtree (a container without a cgroup namespace) still shows the host path in
+// /proc/self/cgroup: strip the mount root so the path is relative to the mount point, else it is left as it is
+static std::string llama_cgroup_mount_relative(const std::string & path, const char * mountinfo, const std::string & mnt, bool v2) {
+    FILE * f = fopen(mountinfo, "r");
+    if (!f) {
+        return path;
+    }
+    std::string res = path;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        // "id parent maj:min root mount-point options [optional...] - fstype source super-options"
+        char mroot[4096];
+        char mpoint[4096];
+        char fstype[64];
+        const char * sep = strstr(line, " - ");
+        if (!sep || sscanf(line, "%*s %*s %*s %4095s %4095s", mroot, mpoint) != 2 ||
+                sscanf(sep + 3, "%63s", fstype) != 1 || strcmp(fstype, v2 ? "cgroup2" : "cgroup") != 0 || mnt != llama_mountinfo_unescape(mpoint)) {
+            continue;
+        }
+        const std::string r = llama_mountinfo_unescape(mroot);
+        if (r != "/" && path.compare(0, r.size(), r) == 0 && (path.size() == r.size() || path[r.size()] == '/')) {
+            res = path.size() == r.size() ? "/" : path.substr(r.size());
+        }
+        break;
+    }
+    fclose(f);
+    return res;
+}
+#endif
+
+size_t llama_mmap::cgroup_budget(size_t budget, const char * self, const char * root, const char * mountinfo) {
+#ifdef __linux__
+    // v2 "0::/path": the tightest of memory.max and memory.high, less memory.current
+    // v1 "N:..,memory,..:/path": memory.limit_in_bytes less memory.usage_in_bytes, under the memory mount
+    // each less the same reserve as the host budget, max(2 GiB, limit/16); over the cgroup and its ancestors, as the limits
+    // are hierarchical. a path under a subtree mount is made relative to it (mountinfo), and the cgroups above the mount
+    // root are not there, so the missing files are skipped: what cannot be read leaves the budget as it is
+    FILE * f = fopen(self, "r");
+    if (!f) {
+        return budget;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        const char * c1 = strchr(line, ':');
+        const char * c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) {
+            continue;
+        }
+        const std::string ctrls = "," + std::string(c1 + 1, c2) + ",";
+        std::string path(c2 + 1);
+        path.erase(path.find_last_not_of("\r\n") + 1);
+        const bool v2 = ctrls == ",," && strncmp(line, "0:", 2) == 0;
+        const bool v1 = ctrls.find(",memory,") != std::string::npos;
+        if ((!v1 && !v2) || path.empty() || path[0] != '/' || path.find("/..") != std::string::npos) {
+            continue;
+        }
+        const std::string base = std::string(root) + (v1 ? "/memory" : "");
+        path = llama_cgroup_mount_relative(path, mountinfo, base, v2);
+        const char * used_name = v1 ? "/memory.usage_in_bytes" : "/memory.current";
+        const char * lim_names[2] = { v1 ? "/memory.limit_in_bytes" : "/memory.max", v1 ? nullptr : "/memory.high" };
+        for (;;) {
+            const std::string dir = base + (path == "/" ? "" : path);
+            unsigned long long used = 0;
+            if (llama_read_u64(dir + used_name, used)) {
+                for (const char * name : lim_names) {
+                    unsigned long long lim = 0;
+                    if (name && llama_read_u64(dir + name, lim)) {
+                        const unsigned long long reserve = std::max(2ull << 30, lim/16);
+                        const unsigned long long left = lim > used && lim - used > reserve ? lim - used - reserve : 0;
+                        budget = (size_t) std::min<unsigned long long>(budget, left);
+                    }
+                }
+            }
+            if (path == "/") {
+                break;
+            }
+            path.erase(std::max<size_t>(path.find_last_of('/'), 1));
+        }
+    }
+    fclose(f);
+#else
+    GGML_UNUSED(self);
+    GGML_UNUSED(root);
+    GGML_UNUSED(mountinfo);
+#endif
+    return budget;
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
@@ -909,8 +1321,4 @@ void llama_prefetch(llama_memory_ranges mr) {
 #else
     GGML_UNUSED(mr);
 #endif
-}
-
-size_t llama_path_max() {
-    return PATH_MAX;
 }

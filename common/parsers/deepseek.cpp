@@ -195,6 +195,14 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             foreach_function(tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
+                if (is_v41 && name.find("::") == std::string::npos) {
+                    // Match qualified_name() in the V4.1 template; rendering above validates conflicts.
+                    const auto ns = tool.contains("namespace") && !tool.at("namespace").is_null()
+                        ? tool.at("namespace") : function.value("namespace", json());
+                    if (!ns.is_null()) {
+                        name = (ns.is_object() ? ns.at("name") : ns).get<std::string>() + "::" + name;
+                    }
+                }
 
                 std::vector<common_peg_parser> required_parsers;
                 std::vector<common_peg_parser> optional_parsers;
@@ -300,7 +308,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     });
 
     if (include_grammar) {
-        data.grammar_lazy = has_tools && !require_tools;
+        data.grammar_lazy = !has_response_format && has_tools && !require_tools;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             data.parser.build_grammar(builder, data.grammar_lazy);
         });

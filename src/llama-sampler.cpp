@@ -2697,8 +2697,6 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
                       const char * grammar_str,
                       const char * grammar_root,
                               bool lazy,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens,
                      const char ** trigger_patterns,
@@ -2727,7 +2725,7 @@ static void llama_sampler_grammar_reset(struct llama_sampler * smpl) {
 static struct llama_sampler * llama_sampler_grammar_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
 
-    auto * result = llama_sampler_init_grammar_impl(ctx->vocab, nullptr, nullptr, false, nullptr, 0, nullptr, 0, nullptr, 0);
+    auto * result = llama_sampler_init_grammar_impl(ctx->vocab, nullptr, nullptr, false, nullptr, 0, nullptr, 0);
     GGML_ASSERT(result);
 
     // copy the state
@@ -2775,8 +2773,6 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
                       const char * grammar_str,
                       const char * grammar_root,
                               bool lazy,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens,
                      const char ** trigger_patterns,
@@ -2784,26 +2780,7 @@ static struct llama_sampler * llama_sampler_init_grammar_impl(
     auto * ctx = new llama_sampler_grammar;
 
     if (grammar_str != nullptr && grammar_str[0] != '\0') {
-        std::string trigger_pattern;
-        llama_grammar * grammar = nullptr;
-        // TODO: remove trigger_words support.
-        if (trigger_words != nullptr && num_trigger_words > 0) {
-            GGML_ASSERT(trigger_patterns == nullptr && num_trigger_patterns == 0);
-            trigger_pattern = "[\\s\\S]*?(";
-            for (size_t i = 0; i < num_trigger_words; ++i) {
-                static const std::regex special_chars("[.^$|()*+?\\[\\]{}\\\\]");
-                if (i > 0) {
-                    trigger_pattern += "|";
-                }
-                trigger_pattern += std::regex_replace(trigger_words[i], special_chars, "\\$0");
-            }
-            trigger_pattern += ")[\\s\\S]*";
-
-            std::array<const char *, 1> tmp_trigger_patterns = { trigger_pattern.c_str() };
-            grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, tmp_trigger_patterns.data(), tmp_trigger_patterns.size(), trigger_tokens, num_trigger_tokens);
-        } else {
-            grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, trigger_patterns, num_trigger_patterns, trigger_tokens, num_trigger_tokens);
-        }
+        llama_grammar * grammar = llama_grammar_init_impl(vocab, grammar_str, grammar_root, lazy, trigger_patterns, num_trigger_patterns, trigger_tokens, num_trigger_tokens);
         *ctx = {
             /* .vocab        = */ vocab,
             /* .grammar_str  = */ grammar_str,
@@ -2833,18 +2810,7 @@ struct llama_sampler * llama_sampler_init_grammar(
         const struct llama_vocab * vocab,
                       const char * grammar_str,
                       const char * grammar_root) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ false, nullptr, 0, nullptr, 0, nullptr, 0);
-}
-
-struct llama_sampler * llama_sampler_init_grammar_lazy(
-        const struct llama_vocab * vocab,
-                      const char * grammar_str,
-                      const char * grammar_root,
-                     const char ** trigger_words,
-                            size_t num_trigger_words,
-               const llama_token * trigger_tokens,
-                            size_t num_trigger_tokens) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_words, num_trigger_words, trigger_tokens, num_trigger_tokens, nullptr, 0);
+    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ false, nullptr, 0, nullptr, 0);
 }
 
 struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
@@ -2855,7 +2821,7 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
-    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+    return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
 }
 
 // penalties
@@ -2961,26 +2927,52 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    auto penalize = [ctx](llama_token_data & cand, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (cand.logit <= 0) {
+            cand.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            cand.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        cand.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // token_count holds at most penalty_last_n entries, so walking it is much cheaper than probing it once per candidate.
+    // This needs cur_p to still be the untouched candidate array, where a token id is its own index and appears once.
+    // The check is a compare per candidate, against a map probe per candidate, and it stops at the first mismatch.
+    bool by_index = cur_p->size == (size_t) ctx->n_vocab;
+
+    if (by_index) {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id != (llama_token) i) {
+                by_index = false;
+                break;
+            }
+        }
+    }
+
+    // Apply frequency and presence penalties to the cur_p
+    if (by_index) {
+        for (const auto & it : ctx->token_count) {
+            // the history can hold ids outside the candidates (e.g. a truncated list or LLAMA_TOKEN_NULL)
+            if (it.first < 0 || (size_t) it.first >= cur_p->size) {
+                continue;
+            }
+            penalize(cur_p->data[it.first], it.second);
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+
+            penalize(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
