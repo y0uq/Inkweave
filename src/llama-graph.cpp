@@ -2649,10 +2649,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
         ggml_tensor * up = nullptr;
+        ggml_tensor * gate_up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (up_exps_s) {
@@ -2739,6 +2740,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     GGML_ASSERT(has_gate);
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
+                    if (gate_up && gate_up->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up)) {
+                        cur = ggml_situ(ctx0, gate_up, beta, lb);
+                        cb(cur, "ffn_moe_situ", il);
+                        break;
+                    }
 
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));

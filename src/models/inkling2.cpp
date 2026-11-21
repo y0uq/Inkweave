@@ -5,7 +5,7 @@
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+static constexpr int64_t n_kq_bias_max  = int64_t(1) << 26;
 static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
@@ -217,20 +217,31 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
 }
 
-// attention over the depth: mix the earlier block outputs and cur with learned queries
-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+static ggml_tensor * inkling2_mix_states(
+        ggml_context * ctx, const std::vector<ggml_tensor *> & blocks, ggml_tensor * current) {
+    const int64_t width = current->ne[0];
+    const int64_t tokens = current->ne[1];
+    ggml_tensor * states = ggml_reshape_3d(ctx, current, width, 1, tokens);
     for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+        states = ggml_concat(ctx, ggml_reshape_3d(ctx, block, width, 1, tokens), states, 1);
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+    return ggml_rms_norm(ctx, states, 1e-6f);
+}
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+static ggml_tensor * inkling2_mix_query(
+        ggml_context * ctx, ggml_tensor * states, ggml_tensor * transposed, ggml_tensor * query) {
+    const int64_t width = states->ne[0];
+    const int64_t tokens = states->ne[2];
+    ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, query->ne[1], tokens));
+    ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(width), 0.0f);
+    return ggml_mul_mat(ctx, transposed, scores);
+}
 
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
-    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
-
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+// Attention over depth mixes earlier block outputs and the current state.
+ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    ggml_tensor * states = inkling2_mix_states(ctx0, blocks, cur);
+    return inkling2_mix_query(ctx0, states, ggml_cont(ctx0, ggml_transpose(ctx0, states)), query);
 }
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
@@ -358,8 +369,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     std::vector<ggml_tensor *> prelude_blocks;
     ggml_tensor *              prelude_cur = nullptr;
-    std::vector<ggml_tensor *> bank;
-    ggml_tensor *              bank_last = nullptr;
+    ggml_tensor * bank_states = nullptr;
+    ggml_tensor * bank_transposed = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -375,10 +386,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     prelude_blocks = blocks;
                     prelude_cur    = cur;
                 } else {
-                    bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-                    bank_last = cur;
-                    blocks    = prelude_blocks;
-                    cur       = prelude_cur;
+                    const std::vector<ggml_tensor *> bank(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
+                    bank_states = inkling2_mix_states(ctx0, bank, cur);
+                    bank_transposed = ggml_cont(ctx0, ggml_transpose(ctx0, bank_states));
+                    blocks = prelude_blocks;
+                    cur = prelude_cur;
                 }
             }
 
@@ -388,13 +400,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_tensor * q_attn = ggml_view_2d(ctx0, model.loop_res_query,    n_embd, 2, model.loop_res_query->nb[1],    row*model.loop_res_query->nb[1]);
                 ggml_tensor * q_kv   = ggml_view_2d(ctx0, model.loop_kv_res_query, n_embd, 2, model.loop_kv_res_query->nb[1], row*model.loop_kv_res_query->nb[1]);
 
-                // rows: (attn, mlp) and (k, v)
-                ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
-                ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
-
-                for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
+                // The four queries share one read of the previous pass's normalized block outputs.
+                ggml_tensor * queries = ggml_concat(ctx0, q_attn, q_kv, 1);
+                ggml_tensor * mixed = inkling2_mix_query(ctx0, bank_states, bank_transposed, queries);
+                constexpr int slots[] = { 0, 3, 1, 2 };
+                for (int j = 0; j < 4; ++j) {
+                    messages[slots[j]] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
                 }
             }
         }
@@ -534,13 +545,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
                 // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
                 const int64_t n_seq_tokens = n_tokens/n_stream;
-                // sized for a full cache so the chunking does not change while it fills
-                const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-                int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
+                // Reserve against a full cache, but size the chunks for the actual active keys during evaluation.
+                int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv*n_head*n_stream),
                         (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
                 if (n_rows_max < n_seq_tokens) {
                     const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-                    n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+                    n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 16));
                 }
                 auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                     int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };

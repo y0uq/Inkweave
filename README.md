@@ -1,3 +1,42 @@
+# Inkling Vulkan
+
+A performance fork of Unsloth llama.cpp for Inkling 2 Mini on AMD Vulkan. The starting point is the compiled source tree from [Unsloth b12588-mix-c0c3de8](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8).
+
+## Build on Linux
+
+Install CMake, Ninja, a C/C++ toolchain, Vulkan headers and loader, glslc, and the Vulkan driver for your GPU. This build uses native CPU tuning and the Vulkan backend.
+
+```sh
+cmake -S . -B build-vulkan -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+    -DGGML_NATIVE=ON -DGGML_LTO=ON -DGGML_OPENMP=ON -DGGML_VULKAN=ON \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF \
+    -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build build-vulkan --parallel --target llama-server
+```
+
+## Serve Inkling 2 Mini
+
+From the repository root, download the model and projector and launch the OpenAI-compatible API.
+
+```sh
+uvx --from huggingface-hub hf download unsloth/Inkling-2-Mini-GGUF \
+    Inkling-2-Mini-UD-Q3_K_XL.gguf mmproj-F16.gguf --local-dir models/Inkling
+GGML_VK_VISIBLE_DEVICES=0 GGML_VK_DIRECT_HOST=1 \
+    ./build-vulkan/bin/llama-server --models-preset examples/inkling-vulkan.ini \
+    --models-max 1 --offline --mmproj-device none --no-mmproj-offload \
+    --host 127.0.0.1 --port 8080
+```
+
+The preset uses a 262,144-token context with Q8_0 K/V and Flash Attention. The RX 9060 XT configuration uses Vulkan0 for language inference and the CPU for the projector. The most frequently visited blocks keep their experts in VRAM. Vulkan buffers expose the other experts in pinned RAM to the GPU so routing and compute can run without per-layer CPU readbacks. Direct host access is opt-in and supports one visible Vulkan device.
+
+The fork also fuses the SiTU expert activation on Vulkan, shares expert-cache entries across visits to the same physical block, reuses normalized previous-pass states, and caps the size of relative attention bias tiles. DSpark is configurable in the preset.
+
+Use `--list-devices` to identify the Vulkan device on other systems. Tune `n-cpu-moe` and `override-tensor` for the available VRAM.
+
+<details>
+<summary>Upstream llama.cpp README</summary>
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
@@ -101,3 +140,5 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+</details>

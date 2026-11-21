@@ -266,9 +266,22 @@ size_t vk_tensor_offset(const ggml_tensor * tensor) {
     return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
 }
 
+static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft);
+
+static bool ggml_vk_direct_host_enabled(uint32_t device_idx) {
+    static const char * value = getenv("GGML_VK_DIRECT_HOST");
+    return value && strcmp(value, "1") == 0 && device_idx == 0 && !vk_instance.multi_device;
+}
+
+static bool ggml_vk_can_bind_host(const vk_device & device, const ggml_tensor * tensor) {
+    return device->uma ||
+        (ggml_vk_direct_host_enabled(device->idx) && tensor->buffer &&
+         tensor->buffer->buft->iface.get_name == ggml_backend_vk_host_buffer_type_name);
+}
+
 size_t ggml_vk_tensor_buffer_offset(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
     // vk_tensor_offset() is relative to vk_ptr_base, but mapped host tensors need an offset relative to their Vulkan buffer.
-    if (ctx->device->uma) {
+    if (ggml_vk_can_bind_host(ctx->device, t)) {
         vk_buffer buf = nullptr;
         size_t off = 0;
         ggml_vk_host_get(ctx->device, t->data, buf, off);
@@ -3922,6 +3935,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(swiglu, SWIGLU)
     CREATE_GLU(swiglu_oai, SWIGLU_OAI)
     CREATE_GLU(swiglu_clamp, SWIGLU_CLAMP)
+    CREATE_GLU(situ, SITU)
     CREATE_GLU(geglu_erf, GEGLU_ERF)
     CREATE_GLU(geglu_quick, GEGLU_QUICK)
 #undef CREATE_GLU
@@ -6402,7 +6416,7 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
 
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-    if (ctx->device->uma) {
+    if (ggml_vk_can_bind_host(ctx->device, tensor)) {
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
@@ -7187,10 +7201,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool src0_uma = false;
     bool src1_uma = false;
 
-    if (ctx->device->uma) {
+    if (ggml_vk_can_bind_host(ctx->device, src0)) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
+    }
+    if (ggml_vk_can_bind_host(ctx->device, src1)) {
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src1_uma = d_Qy != nullptr;
     }
 
@@ -8296,10 +8312,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     bool src0_uma = false;
     bool src1_uma = false;
 
-    if (ctx->device->uma) {
+    if (ggml_vk_can_bind_host(ctx->device, src0)) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
+    }
+    if (ggml_vk_can_bind_host(ctx->device, src1)) {
+        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src1_uma = d_Qy != nullptr;
     }
 
@@ -10963,7 +10981,7 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
         offset[i] = 0;
         uma[i] = false;
 
-        if (ctx->device->uma) {
+        if (ggml_vk_can_bind_host(ctx->device, tensors[i])) {
             ggml_vk_host_get(ctx->device, tensors[i]->data, buf[i], offset[i]);
             uma[i] = buf[i] != nullptr;
         }
@@ -12069,7 +12087,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
             offset[i] = 0;
             uma[i] = false;
 
-            if (ctx->device->uma) {
+            if (ggml_vk_can_bind_host(ctx->device, tensors[i])) {
                 ggml_vk_host_get(ctx->device, tensors[i]->data, buf[i], offset[i]);
                 uma[i] = buf[i] != nullptr;
             }
@@ -13374,6 +13392,29 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
+    const bool host = ggml_backend_buffer_is_host(a->buffer);
+    if (host != ggml_backend_buffer_is_host(b->buffer)) {
+        return false;
+    }
+    if (!host) {
+        const auto * a_ctx = static_cast<ggml_backend_vk_buffer_context *>(a->buffer->context);
+        const auto * b_ctx = static_cast<ggml_backend_vk_buffer_context *>(b->buffer->context);
+        if (a_ctx->dev_buffer != b_ctx->dev_buffer) {
+            return false;
+        }
+    }
+
+    const auto a_offset = host ? reinterpret_cast<uintptr_t>(a->data) : vk_tensor_offset(a) + a->view_offs;
+    const auto b_offset = host ? reinterpret_cast<uintptr_t>(b->data) : vk_tensor_offset(b) + b->view_offs;
+    const auto a_size = ggml_nbytes(a);
+    const auto b_size = ggml_nbytes(b);
+    if (elementwise && a_offset == b_offset && a_size == b_size) {
+        return false;
+    }
+    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+}
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -13425,27 +13466,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         // checked against the written list. Two nodes overlap in memory if they come from the same
         // buffer and the tensor or view ranges overlap.
         auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
-            if (unsynced_nodes.size() == 0) {
-                return false;
-            }
-            auto n_base = vk_tensor_offset(node) + node->view_offs;
-            auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
-            for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
-                if (a_buf == o_buf) {
-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
-                    auto o_size = ggml_nbytes(other);
-
-                    if ((o_base <= n_base && n_base < o_base + o_size) ||
-                        (n_base <= o_base && o_base < n_base + n_size)) {
-                        return true;
-                    }
-                }
-            }
-            return false;
+            return std::any_of(unsynced_nodes.begin(), unsynced_nodes.end(), [&](const ggml_tensor * other) {
+                return ggml_vk_tensors_overlap(node, other, false);
+            });
         };
 
         // For all fused ops, check if the destination node or any of the source
@@ -13729,6 +13752,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
         case GGML_GLU_OP_SWIGLU_CLAMP:
+        case GGML_GLU_OP_SITU:
             ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
             break;
         default:
@@ -14429,6 +14453,16 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         return;
     }
 
+    if (ggml_backend_buffer_is_host(tensor->buffer)) {
+        ggml_backend_synchronize(backend);
+        auto * t = static_cast<char *>(tensor->data) + offset;
+        auto * d = static_cast<const char *>(data);
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy(t + i * stride_tensor, d + i * stride_data, size);
+        }
+        return;
+    }
+
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
     vk_context cpy_ctx;
@@ -14489,6 +14523,16 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
+        return;
+    }
+
+    if (ggml_backend_buffer_is_host(tensor->buffer)) {
+        ggml_backend_synchronize(backend);
+        auto * t = static_cast<const char *>(tensor->data) + offset;
+        auto * d = static_cast<char *>(data);
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy(d + i * stride_data, t + i * stride_tensor, size);
+        }
         return;
     }
 
@@ -15320,29 +15364,6 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
         return false;
     }
     return true;
-}
-
-bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
-    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
-    vk_buffer a_buf = a_buf_ctx->dev_buffer;
-    ggml_backend_vk_buffer_context * b_buf_ctx = (ggml_backend_vk_buffer_context *)b->buffer->context;
-    vk_buffer b_buf = b_buf_ctx->dev_buffer;
-    if (a_buf == b_buf) {
-        auto a_base = vk_tensor_offset(a) + a->view_offs;
-        auto a_size = ggml_nbytes(a);
-        auto b_base = vk_tensor_offset(b) + b->view_offs;
-        auto b_size = ggml_nbytes(b);
-
-        if (elementwise && a_base == b_base && a_size == b_size) {
-            return false;
-        }
-
-        if ((b_base <= a_base && a_base < b_base + b_size) ||
-            (a_base <= b_base && b_base < a_base + a_size)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -16687,6 +16708,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
+                case GGML_GLU_OP_SITU:
+                    return op->type == GGML_TYPE_F32 && !op->src[1] && ggml_is_contiguous(op->src[0]);
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_SWIGLU:
@@ -17305,11 +17328,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 }
 
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    if (ggml_vk_direct_host_enabled(ctx->device) && buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
+        return true;
+    }
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }
 
-    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
 
     return buft_ctx->device->idx == ctx->device;

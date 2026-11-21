@@ -3582,6 +3582,33 @@ static void ggml_compute_forward_swiglu_oai(
     }
 }
 
+static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t width = dst->ne[0];
+    const int64_t rows_per_thread = (ggml_nrows(dst) + params->nth - 1) / params->nth;
+    const int64_t row_start = params->ith * rows_per_thread;
+    const int64_t row_end = std::min(row_start + rows_per_thread, ggml_nrows(dst));
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float linear_beta = ggml_get_op_params_f32(dst, 3);
+    const float inv_beta = 1.0f / beta;
+    const float inv_linear_beta = linear_beta > 0.0f ? 1.0f / linear_beta : 0.0f;
+    const float * input = static_cast<const float *>(src->data);
+    float * output = static_cast<float *>(dst->data);
+
+    for (int64_t row = row_start; row < row_end; ++row) {
+        const float * gate = input + row * 2 * width;
+        const float * up = gate + width;
+        float * out = output + row * width;
+        for (int64_t col = 0; col < width; ++col) {
+            const float g = beta * std::tanh(gate[col] * inv_beta) / (1.0f + std::exp(-gate[col]));
+            const float u = linear_beta > 0.0f ? linear_beta * std::tanh(up[col] * inv_linear_beta) : up[col];
+            out[col] = g * u;
+        }
+    }
+}
+
 // ggml_compute_forward_swiglu_clamp
 
 static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * params, ggml_tensor * dst) {
@@ -10568,6 +10595,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_GEGLU_QUICK:
             {
                 ggml_compute_forward_geglu_quick(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {

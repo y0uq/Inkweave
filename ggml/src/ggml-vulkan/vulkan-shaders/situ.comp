@@ -1,0 +1,13 @@
+#version 450
+
+#include "glu_head.glsl"
+
+float op(float gate, float up) {
+    const float beta = p.alpha;
+    const float linear_beta = p.limit;
+    const float sigmoid = 1.0f / (1.0f + exp(-gate));
+    const float bounded_up = linear_beta > 0.0f ? linear_beta * tanh(up * (1.0f / linear_beta)) : up;
+    return (beta * tanh(gate * (1.0f / beta)) * sigmoid) * bounded_up;
+}
+
+#include "glu_main.glsl"
