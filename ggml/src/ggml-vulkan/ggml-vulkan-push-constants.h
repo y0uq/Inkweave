@@ -809,6 +809,7 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+    float post_scale;
 };
 
 struct vk_op_conv2d_push_constants {

@@ -55,6 +55,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
+    bool inkling_capture_routes = false;
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
@@ -71,6 +72,8 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    ggml_tensor * dspark_fold_weight = nullptr;
+    ggml_tensor * dspark_fold_bias = nullptr;
     const llama_model * model_tgt; // target lending token_embd/output to a draft head without them
 
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()

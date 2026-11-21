@@ -1147,9 +1147,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+    "INKLING_DEPTH_MIX",
+    "INKLING_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1263,9 +1265,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+    "inkling_depth_mix(states,queries)",
+    "inkling_fused(a,b,c,d)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2579,6 +2583,12 @@ struct ggml_tensor * ggml_argmax(
     return result;
 }
 
+struct ggml_tensor * ggml_argmax_first(struct ggml_context * ctx, struct ggml_tensor * a) {
+    struct ggml_tensor * result = ggml_argmax(ctx, a);
+    ggml_set_op_params_i32(result, 0, 1);
+    return result;
+}
+
 // ggml_count_equal
 
 struct ggml_tensor * ggml_count_equal(
@@ -3457,6 +3467,11 @@ void ggml_mul_mat_set_hint(
 
     an id of -1 skips the slot: no matrix is selected, c[:,e,t] is set to zero
 */
+void ggml_mul_mat_id_group_small(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 4, 1);
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
@@ -5566,6 +5581,12 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_causal(struct ggml_tensor * a, int32_t window) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED && a->src[3] == NULL && a->src[7] != NULL);
+    GGML_ASSERT(window >= 0 && window < INT32_MAX);
+    ggml_set_op_params_i32(a, 4, window + 1);
+}
+
 void ggml_flash_attn_ext_banded_set_positions(struct ggml_tensor * a, struct ggml_tensor * positions) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
     GGML_ASSERT(a->src[0]->ne[3] == 1);
@@ -5704,6 +5725,88 @@ struct ggml_tensor * ggml_flash_attn_back(
     result->src[2] = v;
     result->src[3] = d;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_fused(
+        struct ggml_context * ctx,
+        enum ggml_inkling_fusion fusion,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        struct ggml_tensor * c,
+        struct ggml_tensor * d,
+        float value) {
+    struct ggml_tensor * result;
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    struct ggml_tensor * rest[] = { b, c, d };
+    for (int i = 0; i < 3; ++i) {
+        GGML_ASSERT(!rest[i] || (rest[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(rest[i])));
+    }
+    switch (fusion) {
+        case GGML_INKLING_CLIP:
+            GGML_ASSERT(a->ne[3] == 1 && (!b || (b->ne[0] == a->ne[0] && b->ne[1] == a->ne[1] && ggml_is_matrix(b))));
+            result = ggml_dup_tensor(ctx, a);
+            break;
+        case GGML_INKLING_BLEND:
+            GGML_ASSERT(b && c && d && ggml_are_same_shape(a, b) && ggml_are_same_shape(a, c) && ggml_are_same_shape(a, d));
+            result = ggml_dup_tensor(ctx, a);
+            break;
+        case GGML_INKLING_CONV:
+            GGML_ASSERT(b && c && d && b->ne[1] == a->ne[1] && d->ne[0] == a->ne[1] &&
+                a->ne[0] == d->ne[1] + b->ne[0] - 1 && a->ne[2] == d->ne[2] &&
+                c->ne[1] == d->ne[1]*d->ne[2] && c->ne[0] % b->ne[0] == 0 &&
+                (d->ne[0]*b->ne[0]) % c->ne[0] == 0);
+            result = ggml_dup_tensor(ctx, d);
+            break;
+        case GGML_INKLING_EXPERT_SUM:
+            GGML_ASSERT(a->ne[3] == 1 && b && b->ne[0] == 1 && b->ne[1] == a->ne[1] &&
+                b->ne[3] == 1 && (b->ne[2] == a->ne[2] || b->ne[2] == 1));
+            result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[2]);
+            break;
+        default:
+            GGML_ABORT("unsupported Inkling fusion");
+    }
+    result->op = GGML_OP_INKLING_FUSED;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    result->src[3] = d;
+    ggml_set_op_params_i32(result, 0, fusion);
+    ggml_set_op_params_f32(result, 1, value);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_control(
+        struct ggml_context * ctx, struct ggml_tensor * current, struct ggml_tensor * message,
+        struct ggml_tensor * latent, struct ggml_tensor * gain, struct ggml_tensor * forget) {
+    GGML_ASSERT(ggml_are_same_shape(current, message) && ggml_are_same_shape(gain, forget));
+    GGML_ASSERT(ggml_is_matrix(current) && ggml_is_matrix(latent) && ggml_is_matrix(gain));
+    GGML_ASSERT(latent->ne[0] == 64 && gain->ne[0] == 64 &&
+        latent->ne[1] == current->ne[1] && gain->ne[1] == current->ne[0]);
+    struct ggml_tensor * args[] = {current, message, latent, gain, forget};
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, current);
+    result->op = GGML_OP_INKLING_FUSED;
+    for (int i = 0; i < 5; ++i) {
+        GGML_ASSERT(args[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(args[i]));
+        result->src[i] = args[i];
+    }
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_CONTROL);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_depth_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor * states,
+        struct ggml_tensor * queries) {
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && queries->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->ne[3] == 1 && ggml_is_matrix(queries));
+    GGML_ASSERT(ggml_is_contiguous(states) && ggml_is_contiguous(queries));
+    GGML_ASSERT(states->ne[0] == queries->ne[0]);
+    GGML_ASSERT(states->ne[1] > 0 && states->ne[1] <= 16);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, states->ne[0], queries->ne[1], states->ne[2]);
+    result->op = GGML_OP_INKLING_DEPTH_MIX;
+    result->src[0] = states;
+    result->src[1] = queries;
     return result;
 }
 

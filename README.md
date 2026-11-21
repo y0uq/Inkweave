@@ -1,6 +1,6 @@
 # Inkling Vulkan
 
-A performance fork of Unsloth llama.cpp for Inkling 2 Mini on AMD Vulkan. The starting point is the compiled source tree from [Unsloth b12588-mix-c0c3de8](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8).
+A performance fork of Unsloth llama.cpp for Inkling 2 Mini on Vulkan. The tuning target is the Radeon RX 9060 XT 16 GiB (gfx1200) and Ryzen 7 9700X (Zen 5). The fork started from [Unsloth b12588-mix-c0c3de8](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8).
 
 ## Build on Linux
 
@@ -17,37 +17,46 @@ cmake --build build-vulkan --parallel --target llama-server
 
 ## Serve Inkling 2 Mini
 
-From the repository root, download the model and projector and launch the OpenAI-compatible API.
+From the repository root, download the model, Q8_0 DSpark drafter, and projector and launch the OpenAI-compatible API.
 
 ```sh
 uvx --from huggingface-hub hf download unsloth/Inkling-2-Mini-GGUF \
-    Inkling-2-Mini-UD-Q3_K_XL.gguf mmproj-F16.gguf --local-dir models/Inkling
+    Inkling-2-Mini-UD-Q3_K_XL.gguf dspark-Inkling-2-Mini-Q8_0.gguf mmproj-F16.gguf \
+    --local-dir models/Inkling
+
 GGML_VK_VISIBLE_DEVICES=0 GGML_VK_DIRECT_HOST=1 GGML_VK_INKLING_BANDED=1 \
-    ./build-vulkan/bin/llama-server --models-preset examples/inkling-vulkan.ini \
+GGML_VK_INKLING_BANDED_DECODE=1 GGML_VK_INKLING_DEPTH_MIX=1 GGML_VK_INKLING_FUSED=1 \
+GGML_VK_INKLING_BANDED_PROMPT_POSITIONS=1 GGML_VK_INKLING_BOUND_ATTN_SCRATCH=1 \
+LLAMA_INKLING_POLY_MOE=1 LLAMA_INKLING_POLY_SNAPSHOT=1 LLAMA_INKLING_POLY_BATCH_UPLOAD=1 \
+LLAMA_INKLING_DSPARK_DEVICE_FEATURES=1 LLAMA_INKLING_DSPARK_FOLD=1 LLAMA_INKLING_DSPARK_FOLD_Q8=1 \
+    ./build-vulkan/bin/llama-server --models-preset examples/inkling-vulkan-dspark.ini \
     --models-max 1 --offline --mmproj-device none --no-mmproj-offload \
     --host 127.0.0.1 --port 8080
 ```
 
-The preset uses a 262,144-token context with Q8_0 K/V and Flash Attention. The RX 9060 XT configuration uses Vulkan0 for language inference and the CPU for the projector. The most frequently visited blocks keep their experts in VRAM. Vulkan buffers expose the other experts in pinned RAM to the GPU so routing and compute can run without per-layer CPU readbacks. Direct host access is opt-in and supports one visible Vulkan device.
+The DSpark preset allocates a 262,144-token context with Q8_0 K/V for both models, enables Flash Attention, and uses greedy target decoding with up to four draft guesses. Dense weights, KV, and DSpark run on Vulkan0. The projector runs on the CPU. The full expert pool lives in pinned RAM, with 5,750 MiB budgeted for the VRAM expert cache.
 
-The fork also fuses the SiTU expert activation on Vulkan, shares expert-cache entries across visits to the same physical block, reuses normalized residual states, and computes relative attention bias inside the Vulkan Flash Attention kernel on RDNA 4. This banded path uses Q8_0 K/V and FP32 accumulation in a single sequence. It reads a compact position map when the sliding-window cache wraps. The engine tiles the dense bias when it needs the fallback path. DSpark is configurable in the preset.
+The executor shares expert-cache entries across visits to the same physical block and uses recency and reuse to select evictions. It targets a 60% upload and 40% CPU split for eligible misses, favoring CPU execution for low-reuse experts. Vulkan captures routes and activations in the router submission, groups weight uploads, and overlaps the CPU expert work with Vulkan execution. The folded Q8_0 correction matrix is used in the draft head. The target verifies the proposals.
 
-Use `--list-devices` to identify the Vulkan device on other systems. Tune `n-cpu-moe`, `override-tensor`, and `ubatch-size` for the available VRAM. The dense attention fallback can require more scratch space.
+The fork also fuses SiTU and residual operations and computes relative attention bias inside Vulkan Flash Attention on RDNA 4. The banded path uses FP32 accumulation and reads a compact position map when the sliding-window cache wraps. The scratch cap switches long requests to direct Q8_0 attention tiles. Direct host access supports a single visible Vulkan device.
 
-To compare dynamic caching, set `GGML_VK_DIRECT_HOST=0`, replace `n-cpu-moe` with `cpu-moe = true`, leave only the token-embedding placement in `override-tensor`, and set `moe-cache-mib` for the available VRAM.
+Use [the direct preset](examples/inkling-vulkan.ini) for higher prompt throughput with DSpark disabled. For the greedy numbers below, send `temperature: 0` with the request. Tune `moe-cache-mib`, `moe-cache-cpu-share`, `ubatch-size`, and `spec-draft-n-max` in the DSpark preset.
 
 
 ## RX 9060 XT measurements
 
-Measured with the included preset, Inkling 2 Mini UD-Q3_K_XL, 262,144 allocated context tokens, and greedy generation.
+Measured on the same RX 9060 XT and Ryzen 7 9700X with Inkling 2 Mini UD-Q3_K_XL, an 8,195-token mixed prompt, 128 generated tokens, greedy sampling, and 262,144 allocated context tokens.
 
-| Prompt workload | Prefill (tok/s) | Generation (tok/s) | Minimum free VRAM |
+| Profile | Prefill (tok/s) | Generation (tok/s) | Minimum free VRAM during generation |
 | --- | ---: | ---: | ---: |
-| 1,825-token prefill and separate short-prompt decode | 763.7 | 29.7 | 3.01 GiB |
-| 8,195-token prompt followed by 64 generated tokens | 841.2 | 27.3 | 3.35 GiB |
-| 32,835-token prompt followed by 64 generated tokens | 788.6 | 25.0 | 3.16 GiB |
+| Previous public fork (`6e5256529`), direct | 840.77 | 27.79 | 3,422 MiB |
+| Tuned direct | **1,095.17** | 34.48 | 3,488 MiB |
+| Mixed expert execution, direct | 929.53 | 32.56 | 4,259 MiB |
+| Mixed expert execution and four DSpark guesses | 898.88 | **56.15** | 2,899 MiB |
 
-Free VRAM was sampled across the requests, including generation. The 32,835-token prompt was the longest measured. The preset keeps DSpark disabled for speed. The Q8_0 drafter is available from the same Hugging Face repository as `dspark-Inkling-2-Mini-Q8_0.gguf`.
+The tuned direct path improved prefill by 30% and generation by 24% over the previous fork on the 8K fixture. With DSpark, generation reached 2.02× the previous fork's rate. On the 49-token code fixture, generation progressed from 30.00 tok/s on the previous fork to 36.18 tok/s with tuned direct and 50.16 tok/s with four guesses. Earlier DSpark tests on a separate 79-token prompt measured 13.66 tok/s with two guesses and 26.87 tok/s with direct decoding.
+
+The four-guess profile matched all 128 greedy tokens from the tuned direct reference on both fixtures. It maintained at least 2,899 MiB free during generation, 339 MiB above the test floor. Acceptance was 99 of 109 proposals at 8K and 90 of 148 on code. Rates vary with prompt, sampling and acceptance. The 262,144-token allocations were verified at load, and near-full generation headroom for the four-guess preset still needs qualification.
 
 <details>
 <summary>Upstream llama.cpp README</summary>

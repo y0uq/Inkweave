@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-inkling-cache.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -166,6 +167,41 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static bool llama_inkling_trace_routes(ggml_tensor * tensor, bool ask, void * user) {
+    constexpr char prefix[] = "ffn_moe_topk-";
+    if (std::strncmp(tensor->name, prefix, sizeof(prefix) - 1) != 0 || tensor->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    const auto & hp = *static_cast<const llama_hparams *>(user);
+    const int visit = std::atoi(tensor->name + sizeof(prefix) - 1);
+    if (visit < 0 || (uint32_t) visit >= hp.n_layer()) {
+        return true;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    std::vector<uint32_t> counts(hp.n_expert);
+    for (int64_t row = 0; row < tensor->ne[1]; ++row) {
+        for (int64_t j = 0; j < tensor->ne[0]; ++j) {
+            int32_t id;
+            std::memcpy(&id, bytes.data() + row*tensor->nb[1] + j*tensor->nb[0], sizeof(id));
+            if (id >= 0 && (uint32_t) id < counts.size()) {
+                ++counts[id];
+            }
+        }
+    }
+    std::string line;
+    for (uint32_t id = 0; id < counts.size(); ++id) {
+        if (counts[id]) {
+            line += " " + std::to_string(id) + ":" + std::to_string(counts[id]);
+        }
+    }
+    LLAMA_LOG_INFO("inkling routes %u%s\n", hp.loop_layer(visit), line.c_str());
+    return true;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -229,6 +265,10 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (!cparams.cb_eval && model.arch == LLM_ARCH_INKLING2 && std::getenv("LLAMA_INKLING_EXPERT_TRACE")) {
+        cparams.cb_eval = llama_inkling_trace_routes;
+        cparams.cb_eval_user_data = const_cast<llama_hparams *>(&hparams);
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -571,6 +611,8 @@ llama_context::llama_context(
         }
     }
 
+    prepare_dspark_fold();
+
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
@@ -662,6 +704,14 @@ llama_context::llama_context(
         }
     }
 
+    if (!model.inkling_expert_admission.empty() && cparams.n_seq_max == 1 && !model.no_alloc()) {
+        inkling_cache = std::make_unique<llama_inkling_cache>(model);
+        if (!inkling_cache->enabled()) {
+            LLAMA_LOG_WARN("inkling adaptive cache: initialization failed, keeping static placement\n");
+            inkling_cache.reset();
+        }
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -671,6 +721,101 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+void llama_context::prepare_dspark_fold() {
+    if (!std::getenv("LLAMA_INKLING_DSPARK_FOLD") || !cparams.ctx_other ||
+        model.no_alloc() || !model.dspark_hidden_out || !model.dspark_hidden_out_b ||
+        !model.hdmd.rot.empty()) {
+        return;
+    }
+    const auto & target = *llama_get_model(cparams.ctx_other);
+    if (target.arch != LLM_ARCH_INKLING2 || !target.output || !target.hdmd.rot.empty()) {
+        return;
+    }
+
+    auto * dev = target.dev_output();
+    if (!dev || std::strncmp(ggml_backend_dev_name(dev), "Vulkan", 6) != 0 ||
+            std::getenv("LLAMA_INKLING_DSPARK_HOST_HEAD")) {
+        return;
+    }
+    auto it = std::find_if(backends.begin(), backends.end(), [dev](const auto & backend) {
+        return ggml_backend_get_device(backend.get()) == dev;
+    });
+    if (it == backends.end()) {
+        return;
+    }
+    auto * backend = it->get();
+    auto * buft = ggml_backend_get_default_buffer_type(backend);
+    for (const auto * tensor : {target.output, target.output_s, model.dspark_hidden_out, model.dspark_hidden_out_b}) {
+        if (tensor && (!tensor->buffer || ggml_backend_buffer_get_type(tensor->buffer) != buft)) {
+            return;
+        }
+    }
+
+    constexpr size_t max_nodes = 48;
+    ggml_context_ptr weights(ggml_init({ 4 * ggml_tensor_overhead(), nullptr, true }));
+    ggml_context_ptr graph_ctx(ggml_init({
+        max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false), nullptr, true,
+    }));
+    if (!weights || !graph_ctx) {
+        return;
+    }
+    auto * ctx = graph_ctx.get();
+    const int64_t width = model.hparams.n_embd;
+    const int64_t rank = model.hparams.dspark_markov_rank;
+    const int64_t vocab = model.hparams.n_vocab_unpadded;
+    const char * fold_q8 = std::getenv("LLAMA_INKLING_DSPARK_FOLD_Q8");
+    const bool quantized = fold_q8 && std::strcmp(fold_q8, "1") == 0 && rank % ggml_blck_size(GGML_TYPE_Q8_0) == 0;
+    auto * folded = ggml_new_tensor_2d(weights.get(), quantized ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, rank, vocab);
+    auto * bias = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, vocab);
+    ggml_set_name(folded, "dspark.fold.weight");
+    ggml_set_name(bias, "dspark.fold.bias");
+    ggml_backend_buffer_ptr storage(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
+    if (!storage) {
+        LLAMA_LOG_WARN("%s: allocation failed, using the original DSpark head\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(storage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    auto * output = ggml_view_2d(ctx, target.output, width, vocab, target.output->nb[1], 0);
+    auto * correction = model.dspark_hidden_out;
+    if (correction->type != GGML_TYPE_F32) {
+        correction = ggml_cast(ctx, correction, GGML_TYPE_F32);
+    }
+    auto * vectors = ggml_cont(ctx, ggml_transpose(ctx, correction));
+    auto * product = ggml_mul_mat(ctx, output, vectors);
+    auto * shift = ggml_mul_mat(ctx, output, model.dspark_hidden_out_b);
+    ggml_prec_set_acc(product, GGML_PREC_F32);
+    ggml_prec_set_acc(shift, GGML_PREC_F32);
+    if (target.output_s) {
+        product = ggml_mul(ctx, product, target.output_s);
+        shift = ggml_mul(ctx, shift, target.output_s);
+    }
+    auto * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    auto * folded_rows = ggml_transpose(ctx, product);
+    if (quantized) {
+        folded_rows = ggml_cont(ctx, folded_rows);
+    }
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, folded_rows, folded));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, shift, vocab), bias));
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (!ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i))) {
+            LLAMA_LOG_WARN("%s: unsupported fold operation, using the original DSpark head\n", __func__);
+            return;
+        }
+    }
+    ggml_gallocr_ptr alloc(ggml_gallocr_new(buft));
+    if (!alloc || !ggml_gallocr_alloc_graph(alloc.get(), gf) || ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_WARN("%s: fold failed, using the original DSpark head\n", __func__);
+        return;
+    }
+    ctx_dspark_fold = std::move(weights);
+    buf_dspark_fold = std::move(storage);
+    cparams.dspark_fold_weight = folded;
+    cparams.dspark_fold_bias = bias;
+    LLAMA_LOG_INFO("inkling DSpark folded head: %.2f MiB on %s (%s)\n",
+        ggml_backend_buffer_get_size(buf_dspark_fold.get()) / 1048576.0, ggml_backend_dev_name(dev), ggml_type_name(folded->type));
 }
 
 llama_context::~llama_context() {
@@ -1029,6 +1174,17 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+void llama_context::inkling_collect_routes(uint32_t rows) {
+    cparams.inkling_capture_routes = rows && rows <= llama_inkling_cache::max_rows && inkling_cache && inkling_cache->enabled();
+}
+
+void llama_context::inkling_commit_routes(uint32_t rows) {
+    if (cparams.inkling_capture_routes) {
+        inkling_cache->commit(rows);
+        cparams.inkling_capture_routes = false;
+    }
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -1168,6 +1324,15 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     }
 
     return j;
+}
+
+llama_token llama_context::get_draft_token_ith(int32_t i) {
+    if (draft_tokens.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    synchronize();
+    output_reorder();
+    return draft_tokens.at(output_resolve_row(i));
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
@@ -2185,6 +2350,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtype) {
+    if (!draft_tokens.empty()) {
+        synchronize();
+        draft_tokens.clear();
+    }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2457,6 +2626,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
             t_embd = res->get_embd_pooled();
         }
 
+        if (auto * ids = res->t_draft_tokens) {
+            if (draft_tokens.empty()) {
+                draft_tokens.resize(n_outputs_all, LLAMA_TOKEN_NULL);
+            }
+            GGML_ASSERT(ids->ne[0] == n_outputs && n_outputs_prev + n_outputs <= n_outputs_all);
+            auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), ids);
+            ggml_backend_tensor_get_async(backend, ids, draft_tokens.data() + n_outputs_prev,
+                0, n_outputs * sizeof(llama_token));
+        }
+
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
@@ -2530,6 +2709,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
                         GGML_ABORT("unknown pooling type");
                     }
             }
+        }
+
+        if (cparams.inkling_capture_routes && n_tokens_prev == 0 && ubatch.n_tokens == n_tokens_all &&
+                !res->t_inkling_routes.empty()) {
+            auto * backend = backend_from_dev(model.dev_layer(0));
+            inkling_cache->collect(backend, res->t_inkling_routes, ubatch.n_tokens);
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
@@ -2655,6 +2840,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
     //synchronize();
 
     return 0;
+}
+
+llama_token llama_draft_get_token_ith(llama_context * ctx, int32_t i) {
+    return ctx ? ctx->get_draft_token_ith(i) : LLAMA_TOKEN_NULL;
 }
 
 bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd base, llama_embd context,
@@ -2907,7 +3096,10 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        if (!draft_tokens.empty()) {
+            std::swap(draft_tokens[i0], draft_tokens[i1]);
+        }
+        if (logits.size > 0 && draft_tokens.empty()) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -4752,6 +4944,14 @@ void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
 
+void llama_inkling_collect_routes(llama_context * ctx, uint32_t rows) {
+    ctx->inkling_collect_routes(rows);
+}
+
+void llama_inkling_commit_routes(llama_context * ctx, uint32_t rows) {
+    ctx->inkling_commit_routes(rows);
+}
+
 float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 
@@ -5263,6 +5463,13 @@ int32_t llama_draft_backbone(llama_context * ctx, const llama_batch_ext * batch)
         return -1;
     }
     return ctx->decode(*batch, LLM_GRAPH_TYPE_DRAFT_BACKBONE);
+}
+
+int32_t llama_draft_greedy(llama_context * ctx, const llama_batch_ext * batch) {
+    if (!ctx || !batch || !llama_get_model(ctx)->hparams.dspark_markov_rank) {
+        return -1;
+    }
+    return ctx->decode(*batch, LLM_GRAPH_TYPE_DRAFT_GREEDY);
 }
 
 bool llama_draft_step(llama_context * ctx, llama_token token, llama_embd hidden, llama_embd base,

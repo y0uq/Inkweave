@@ -1629,7 +1629,15 @@ static void ggml_compute_forward_argmax_f32(
         float * src = (float *) ((char *) src0->data + i1*nb01);
         int32_t * dst_ = (int32_t *) ((char *)  dst->data + i1*nb0);
         int v = 0;
-        ggml_vec_argmax_f32(ne00, &v, src);
+        if (ggml_get_op_params_i32(dst, 0)) {
+            for (int64_t j = 1; j < ne00; ++j) {
+                if (src[j] > src[v]) {
+                    v = j;
+                }
+            }
+        } else {
+            ggml_vec_argmax_f32(ne00, &v, src);
+        }
         dst_[0] = v;
     }
 }
@@ -3584,7 +3592,10 @@ static void ggml_compute_forward_swiglu_oai(
 
 static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * routes = dst->src[2];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!routes || (routes->type == GGML_TYPE_I32 && ggml_is_contiguous(routes) &&
+                           ggml_nelements(routes) == ggml_nrows(dst)));
 
     const int64_t width = dst->ne[0];
     const int64_t rows_per_thread = (ggml_nrows(dst) + params->nth - 1) / params->nth;
@@ -3595,12 +3606,17 @@ static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_t
     const float inv_beta = 1.0f / beta;
     const float inv_linear_beta = linear_beta > 0.0f ? 1.0f / linear_beta : 0.0f;
     const float * input = static_cast<const float *>(src->data);
+    const auto * ids = routes ? static_cast<const int32_t *>(routes->data) : nullptr;
     float * output = static_cast<float *>(dst->data);
 
     for (int64_t row = row_start; row < row_end; ++row) {
+        float * out = output + row * width;
+        if (ids && ids[row] == -1) {
+            memset(out, 0, width * sizeof(float));
+            continue;
+        }
         const float * gate = input + row * 2 * width;
         const float * up = gate + width;
-        float * out = output + row * width;
         for (int64_t col = 0; col < width; ++col) {
             const float g = beta * std::tanh(gate[col] * inv_beta) / (1.0f + std::exp(-gate[col]));
             const float u = linear_beta > 0.0f ? linear_beta * std::tanh(up[col] * inv_linear_beta) : up[col];
@@ -9066,6 +9082,17 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 continue;
             }
 
+            const int32_t causal_window = rel ? ggml_get_op_params_i32(dst, 4) : 0;
+            if (causal_window) {
+                GGML_ASSERT(positions);
+                const int32_t key_pos = positions[neq1 + ik1];
+                const int64_t distance = int64_t(positions[iq1]) - key_pos;
+                if (key_pos == INT32_MIN || distance < 0 ||
+                        (causal_window > 1 && distance >= causal_window - 1)) {
+                    continue;
+                }
+            }
+
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + (ik1*nbk1 + ik2*nbk2 + ik3*nbk3);
@@ -10024,6 +10051,129 @@ void ggml_compute_forward_flash_attn_back(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+void ggml_compute_forward_inkling_fused(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * a = static_cast<const float *>(dst->src[0]->data);
+    const auto * b = dst->src[1] ? static_cast<const float *>(dst->src[1]->data) : nullptr;
+    const auto * c = dst->src[2] ? static_cast<const float *>(dst->src[2]->data) : nullptr;
+    const auto * d = dst->src[3] ? static_cast<const float *>(dst->src[3]->data) : nullptr;
+    auto * out = static_cast<float *>(dst->data);
+    const int64_t width = dst->ne[0];
+    const int64_t rows = ggml_nrows(dst);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+    switch (ggml_get_op_params_i32(dst, 0)) {
+        case GGML_INKLING_CLIP: {
+            for (int64_t row = params->ith; row < rows; row += params->nth) {
+                const int64_t off = row * width;
+                const int64_t woff = (row % dst->ne[1]) * width;
+                float sum = 0.0f;
+                for (int64_t x = 0; x < width; ++x) {
+                    const float v = b ? a[off + x] * b[woff + x] : a[off + x];
+                    out[off + x] = v;
+                    sum += v*v;
+                }
+                const float factor = std::min(1.0f, scale/(sqrtf(sum) + 1e-6f));
+                for (int64_t x = 0; x < width; ++x) {
+                    out[off + x] *= factor;
+                }
+            }
+        } break;
+        case GGML_INKLING_BLEND: {
+            for (int64_t row = params->ith; row < rows; row += params->nth) {
+                for (int64_t x = row*width; x < (row + 1)*width; ++x) {
+                    out[x] = (1.0f - tanhf(d[x]))*a[x] + tanhf(c[x])*b[x];
+                }
+            }
+        } break;
+        case GGML_INKLING_CONV: {
+            const int64_t taps = dst->src[1]->ne[0];
+            const int64_t channels_per_head = width*taps / dst->src[2]->ne[0];
+            const int64_t samples = dst->src[0]->ne[0];
+            for (int64_t row = params->ith; row < rows; row += params->nth) {
+                const int64_t seq = row / dst->ne[1];
+                const int64_t time = row % dst->ne[1];
+                for (int64_t x = 0; x < width; ++x) {
+                    const float * win = a + (seq*width + x)*samples + time;
+                    const float * weights = b + x*taps;
+                    const float * dyn = c + (row*(width / channels_per_head) + x/channels_per_head)*taps;
+                    float sum = 0.0f;
+                    for (int64_t lag = 0; lag < taps; ++lag) {
+                        sum += win[lag] * weights[lag];
+                    }
+                    for (int64_t lag = 0; lag < taps; ++lag) {
+                        sum += win[taps - 1 - lag] * dyn[lag];
+                    }
+                    out[row*width + x] = (sum + d[row*width + x])*scale;
+                }
+            }
+        } break;
+        case GGML_INKLING_EXPERT_SUM: {
+            const int64_t slots = dst->src[0]->ne[1];
+            const bool broadcast = dst->src[1]->ne[2] == 1;
+            for (int64_t row = params->ith; row < rows; row += params->nth) {
+                const float * weights = b + (broadcast ? 0 : row*slots);
+                for (int64_t x = 0; x < width; ++x) {
+                    float sum = a[row*slots*width + x] * weights[0];
+                    for (int64_t j = 1; j < slots; ++j) {
+                        sum += a[(row*slots + j)*width + x] * weights[j];
+                    }
+                    out[row*width + x] = sum;
+                }
+            }
+        } break;
+        case GGML_INKLING_CONTROL: {
+            const auto * forget = static_cast<const float *>(dst->src[4]->data);
+            for (int64_t row = params->ith; row < rows; row += params->nth) {
+                for (int64_t x = 0; x < width; ++x) {
+                    float gain_value = 0.0f;
+                    float forget_value = 0.0f;
+                    ggml_vec_dot_f32(64, &gain_value, 0, c + row*64, 0, d + x*64, 0, 1);
+                    ggml_vec_dot_f32(64, &forget_value, 0, c + row*64, 0, forget + x*64, 0, 1);
+                    const int64_t i = row*width + x;
+                    out[i] = (1.0f - tanhf(forget_value)) * a[i] + tanhf(gain_value) * b[i];
+                }
+            }
+        } break;
+        default: GGML_ABORT("unsupported Inkling fusion");
+    }
+}
+
+void ggml_compute_forward_inkling_depth_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * states = dst->src[0];
+    const ggml_tensor * queries = dst->src[1];
+    const int64_t width = states->ne[0];
+    const int64_t depth = states->ne[1];
+    const int64_t nq = queries->ne[1];
+    const int64_t rows = states->ne[2] * nq;
+    const float scale = 1.0f/sqrtf(width);
+    for (int64_t row = params->ith; row < rows; row += params->nth) {
+        const auto * x = static_cast<const float *>(states->data) + (row/nq)*depth*width;
+        const auto * q = static_cast<const float *>(queries->data) + (row%nq)*width;
+        float * out = static_cast<float *>(dst->data) + row*width;
+        float weights[16];
+        float max_score = -INFINITY;
+        for (int64_t d = 0; d < depth; ++d) {
+            ggml_vec_dot_f32((int) width, &weights[d], 0, x + d*width, 0, q, 0, 1);
+            weights[d] *= scale;
+            max_score = std::max(max_score, weights[d]);
+        }
+        float sum = 0;
+        for (int64_t d = 0; d < depth; ++d) {
+            weights[d] = expf(weights[d] - max_score);
+            sum += weights[d];
+        }
+        for (int64_t d = 0; d < depth; ++d) {
+            weights[d] /= sum;
+        }
+        for (int64_t i = 0; i < width; ++i) {
+            float value = 0;
+            for (int64_t d = 0; d < depth; ++d) {
+                value += weights[d] * x[d*width + i];
+            }
+            out[i] = value;
+        }
     }
 }
 

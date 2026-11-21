@@ -24,6 +24,8 @@ struct llama_moe_cache_lookup {
     int32_t       il      = -1;
     ggml_tensor * slots   = nullptr; // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, nullptr if the layer does not read the cache
     ggml_tensor * cpu_ids = nullptr; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
+    ggml_tensor * cpu_input = nullptr;
+    ggml_tensor * cpu_routes = nullptr;
 };
 
 // builds the experts selected by mm_ids up to the down projection, from the MoE cache if cached: [n_embd, n_expert_used, n_tokens]
@@ -46,7 +48,8 @@ public:
 
     // 1. the lookup of the selected experts in the cache, built after the expert input and before the expert matmuls
     //    returns no slots if the layer does not read its experts from the cache for this ubatch
-    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts) const;
+    llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts,
+            ggml_tensor * expert_input) const;
 
     // 2. the experts of a layer with slots, from the cache and from the host experts: [n_embd, n_expert_used, n_tokens]
     // calls build synchronously; does not retain user_data

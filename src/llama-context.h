@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_inkling_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -60,6 +61,9 @@ struct llama_context {
 
     void synchronize();
 
+    void inkling_collect_routes(uint32_t rows);
+    void inkling_commit_routes(uint32_t rows);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -83,6 +87,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    llama_token get_draft_token_ith(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -347,6 +352,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    std::unique_ptr<llama_inkling_cache> inkling_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -460,6 +466,10 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    std::vector<llama_token> draft_tokens;
+    ggml_context_ptr ctx_dspark_fold;
+    ggml_backend_buffer_ptr buf_dspark_fold;
+    void prepare_dspark_fold();
 
     // device buffer with enabled layer inputs, [n_layer_inp*n_embd, n_batch], row = batch index
     ggml_context_ptr        ctx_layer_inp_dev;

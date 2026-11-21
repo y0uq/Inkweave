@@ -1255,6 +1255,7 @@ struct ggml_backend_sched {
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
     int prefetch_backend_id; // the backend that copies them
+    size_t n_host_overlaps;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2210,6 +2211,38 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
+static bool ggml_backend_sched_can_run_host_split(const ggml_backend_sched_t sched, int split_id) {
+    const auto & split = sched->splits[split_id];
+    const auto & prev = sched->splits[split_id - 1];
+    int first = 0;
+    while (first < split.graph.n_nodes && ggml_is_view_op(split.graph.nodes[first]->op)) {
+        ++first;
+    }
+    if (split.backend_id != sched->n_backends - 1 || first == split.graph.n_nodes ||
+            !(split.graph.nodes[first]->flags & GGML_TENSOR_FLAG_HOST_INDEPENDENT)) {
+        return false;
+    }
+
+    // The CPU and GPU allocators are separate. The GPU may still read host weights,
+    // but it must not access any host scratch that the CPU split can reuse.
+    for (int i = 0; i < prev.graph.n_nodes; ++i) {
+        const auto * node = prev.graph.nodes[i];
+        if (ggml_is_view_op(node->op) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        if (!node->buffer || ggml_backend_buffer_is_host(node->buffer)) {
+            return false;
+        }
+        for (const auto * src : node->src) {
+            if (src && src->buffer && ggml_backend_buffer_is_host(src->buffer) &&
+                    !ggml_backend_sched_is_host_weight(src)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2224,7 +2257,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+            if (ggml_backend_sched_can_run_host_split(sched, split_id)) {
+                ++sched->n_host_overlaps;
+            } else if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
@@ -2375,6 +2410,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->n_host_overlaps > 0) {
+        GGML_LOG_INFO("ggml_backend_sched: %zu independent host splits dispatched without GPU wait\n", sched->n_host_overlaps);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {

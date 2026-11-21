@@ -1246,6 +1246,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
+                    store_context_features(seq_id, n_chunk);
                     continue;
                 }
 
@@ -1377,6 +1378,7 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
     // Inkling2 DSpark: a recurrent markov head conditioned on the context features of the anchor,
     // which come back from the injection and are kept per sequence, indexed by position
+    bool    boundary_device = false;
     bool    has_rnn_context = false;
     int32_t markov_rank     = 0;
 
@@ -1439,11 +1441,12 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
             /* .backend_sampling = */ !has_rnn_context,
-            /* .dev_features     = */ !has_rnn_context,
+            /* .dev_features     = */ !has_rnn_context || std::getenv("LLAMA_INKLING_DSPARK_DEVICE_FEATURES"),
             /* .nextn_masked     = */ !has_rnn_context,
         });
 
         if (has_rnn_context) {
+            boundary_device = use_dev_features && llama_set_embeddings_nextn_dev(this->params.ctx_dft, true);
             // Inkling2 uses host sampling to keep the first-maximum tie rule.
             for (auto & s : smpls) {
                 common_params_sampling sparams;
@@ -1461,20 +1464,36 @@ protected:
             return;
         }
         // Keep the committed boundary when the target rejects part of a verification batch.
-        const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
-        if (projected) {
-            const size_t seq_offset = (size_t) seq_id * context_rows;
-            const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const llama_pos pos = batch_inject.tokens[i].pos[0];
-                if (pos < pos_min) {
-                    continue;
-                }
-                const size_t slot = seq_offset + (size_t) pos % context_rows;
-                std::memcpy(context_embd.data() + slot * (size_t) n_embd_dec,
-                        projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
-                context_pos[slot] = pos;
+        const size_t seq_offset = (size_t) seq_id * context_rows;
+        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+        int32_t first = 0;
+        while (first < n_chunk && batch_inject.tokens[first].pos[0] < pos_min) {
+            ++first;
+        }
+        if (first == n_chunk) {
+            return;
+        }
+        std::vector<float> boundary;
+        const float * projected;
+        if (boundary_device) {
+            boundary.resize((n_chunk - first) * (size_t) n_embd_dec);
+            if (!llama_get_embeddings_nextn_rows(params.ctx_dft, first, n_chunk - first, boundary.data())) {
+                throw std::runtime_error("DSpark could not read its committed boundary");
             }
+            projected = boundary.data();
+        } else {
+            projected = llama_get_embeddings_nextn(params.ctx_dft);
+            if (!projected) {
+                return;
+            }
+            projected += (size_t) first * n_embd_dec;
+        }
+        for (int32_t i = first; i < n_chunk; ++i) {
+            const llama_pos pos = batch_inject.tokens[i].pos[0];
+            const size_t slot = seq_offset + (size_t) pos % context_rows;
+            std::memcpy(context_embd.data() + slot * (size_t) n_embd_dec,
+                    projected + (size_t) (i - first) * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+            context_pos[slot] = pos;
         }
     }
 
@@ -1484,6 +1503,9 @@ public:
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
+        const bool sample_rnn = has_rnn_context && params.probabilistic;
+        const bool greedy_rnn = has_rnn_context && !sample_rnn;
+        const bool compact_sample = sample_rnn && std::getenv("LLAMA_INKLING_DSPARK_SAMPLE_COMPACT");
 
         // build one batch holding every drafting sequence's noise block into a single decode
         // record where each block starts and its size
@@ -1492,7 +1514,7 @@ public:
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
+            if (!dp.drafting || params.n_max <= 0) {
                 continue;
             }
 
@@ -1506,8 +1528,9 @@ public:
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
-                if (has_rnn_context) {
+                const bool output = compact_sample ? i > 0 && i <= n_draft : !greedy_rnn || i <= n_draft;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
+                if (has_rnn_context && !compact_sample) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;
                     const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
@@ -1523,10 +1546,10 @@ public:
             return;
         }
 
-        const bool sample_rnn = has_rnn_context && params.probabilistic;
         // decode all sequence's noise block in a single batch
-        int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
-                             : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        const int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get()) :
+                        greedy_rnn ? llama_draft_greedy(ctx_dft, batch.get()) :
+                                     llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
@@ -1537,9 +1560,23 @@ public:
         if (sample_rnn) {
             const float * rows = llama_get_embeddings_nextn(ctx_dft);
             hidden.assign(rows, rows + size_t(batch.size())*n_embd_dec);
-            for (int32_t i = 0; i < batch.size(); ++i) {
-                const float * logits = llama_get_logits_ith(ctx_dft, i);
-                base_logits.insert(base_logits.end(), logits, logits + n_vocab);
+            if (compact_sample) {
+                const size_t outputs_per_seq = std::min(block_size - 1, params.n_max);
+                base_logits.reserve(size_t(batch.size() / block_size) * outputs_per_seq * n_vocab);
+                for (const int32_t start : i_block_beg) {
+                    if (start < 0) {
+                        continue;
+                    }
+                    for (size_t output = 1; output <= outputs_per_seq; ++output) {
+                        const float * logits = llama_get_logits_ith(ctx_dft, start + output);
+                        base_logits.insert(base_logits.end(), logits, logits + n_vocab);
+                    }
+                }
+            } else {
+                for (int32_t i = 0; i < batch.size(); ++i) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, i);
+                    base_logits.insert(base_logits.end(), logits, logits + n_vocab);
+                }
             }
         }
 
@@ -1568,9 +1605,10 @@ public:
                 llama_token prev = dp.id_last;
                 for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
                     const size_t row = beg + i;
+                    const size_t logit_row = compact_sample ? size_t(beg / block_size) * std::min(block_size - 1, params.n_max) + i - 1 : row;
                     if (!llama_draft_step(ctx_dft, prev,
                             { hidden.data() + row*n_embd_dec, 1, size_t(n_embd_dec) },
-                            { base_logits.data() + row*n_vocab, 1, size_t(n_vocab) }, context, state, logits)) {
+                            { base_logits.data() + logit_row*n_vocab, 1, size_t(n_vocab) }, context, state, logits)) {
                         result.clear();
                         if (dp.result_q) {
                             dp.result_q->clear();
@@ -1620,6 +1658,13 @@ public:
                     break;
                 }
 
+                if (greedy_rnn) {
+                    const llama_token token = llama_draft_get_token_ith(ctx_dft, idx);
+                    if (token != LLAMA_TOKEN_NULL) {
+                        result.push_back(token);
+                        continue;
+                    }
+                }
                 const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
                 if (has_rnn_context) {
                     // Use the first maximum, as in the RNN conditioning graph.

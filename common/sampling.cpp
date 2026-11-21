@@ -806,13 +806,29 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             continue;
         }
 
+        // A full-vocabulary DSpark proposal is stored in token ID order.
+        // Validate that layout once before using a direct lookup in the residual.
+        bool q_indexed = cur_p->size > 1;
+        for (size_t k = 0; q_indexed && k < q.size(); ++k) {
+            q_indexed = q[k].id >= 0 && (size_t) q[k].id == k;
+        }
+
+        const auto q_of = [&](llama_token id) {
+            if (!q_indexed) {
+                return prob_of(q.data(), q.size(), id);
+            }
+            const size_t index = (size_t) id;
+            return index < q.size() ? q[index].p : 0.0f;
+        };
+
         // rejected: tokens outside q's support keep all of p
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const llama_token id = cur_p->data[k].id;
+            const float r = p_of(k) - q_of(id);
             if (r > 0.0f) {
-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                residual.push_back({ id, 0.0f, r });
                 sum += r;
             }
         }

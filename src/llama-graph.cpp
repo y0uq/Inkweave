@@ -1486,8 +1486,11 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
-    if (banded_swa_positions && banded_swa_positions->buffer) {
-        attn_ctx->get_swa()->set_input_banded_positions(banded_swa_positions, ubatch);
+    for (int i = 0; i < 2; ++i) {
+        if (banded_positions[i] && banded_positions[i]->buffer) {
+            const auto * cache = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+            cache->set_input_banded_positions(banded_positions[i], ubatch, banded_causal_map);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1534,7 +1537,14 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
-    if (banded) {
+    if (banded_causal_map) {
+        res &= params.ubatch.n_seqs_unq == 1 && params.cparams.causal_attn;
+        if (banded_prompt_positions) {
+            res &= params.ubatch.token && !params.ubatch.embd && !params.ubatch.is_mixed();
+        }
+        res &= attn_ctx->get_base()->get_n_kv() == n_kv_banded[0];
+        res &= attn_ctx->get_swa()->get_n_kv() == n_kv_banded[1];
+    } else if (banded) {
         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
         const uint32_t swa_contiguous = attn_ctx->get_swa()->get_n_kv_pos_contiguous();
         const bool swa_explicit = swa_contiguous == 0 && params.ubatch.n_seqs_unq == 1;
@@ -1612,6 +1622,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_draft_tokens = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1625,6 +1636,7 @@ void llm_graph_result::reset() {
     t_candidates.clear();
     t_sampling_all.clear();
     t_moe_ids.clear();
+    t_inkling_routes.clear();
 
     params = {};
 
@@ -1659,6 +1671,9 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_draft_tokens != nullptr) {
+        ggml_set_output(t_draft_tokens);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -1968,6 +1983,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
 
+    if (model.arch == LLM_ARCH_INKLING2) {
+        ggml_mul_mat_id_group_small(res);
+    }
     prec_policy.apply(res);
 
     if (w->type == GGML_TYPE_NVFP4) {
@@ -2567,6 +2585,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+    if (arch == LLM_ARCH_INKLING2 && cparams.inkling_capture_routes) {
+        ggml_set_output(selected_experts->view_src ? selected_experts->view_src : selected_experts);
+        res->t_inkling_routes.push_back(selected_experts);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -2640,7 +2662,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts of host-resident layers may be read from the MoE cache (see llama_moe_cache::build_lookup)
     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
-        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
+        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts, cur);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2748,6 +2770,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float lb   = hparams.situ_linear_beta;
                     if (gate_up && gate_up->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up)) {
                         cur = ggml_situ(ctx0, gate_up, beta, lb);
+                        static const bool poly_moe = getenv("LLAMA_INKLING_POLY_MOE") != nullptr;
+                        if (poly_moe && arch == LLM_ARCH_INKLING2 && !cached && mm_ids && ggml_is_contiguous(mm_ids)) {
+                            // The CPU branch only activates the slots assigned to it.
+                            cur->src[2] = mm_ids;
+                        }
                         cb(cur, "ffn_moe_situ", il);
                         break;
                     }
@@ -2842,6 +2869,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
+    static const bool inkling_fused = getenv("GGML_VK_INKLING_FUSED") != nullptr;
+    if (inkling_fused && arch == LLM_ARCH_INKLING2 && !weight_before_ffn &&
+            ggml_is_contiguous(experts) && ggml_is_contiguous(weights) &&
+            experts->ne[1] == hparams.n_expert_used(il)) {
+        auto * op = ggml_inkling_fused(ctx0, GGML_INKLING_EXPERT_SUM, experts, weights, nullptr, nullptr, 0.0f);
+        if (auto * dev = model.dev_layer(il); dev && ggml_backend_dev_supports_op(dev, op)) {
+            cb(op, "ffn_moe_out", il);
+            return op;
+        }
+    }
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);

@@ -36,7 +36,7 @@ void main() {
     uint lm_stride = p.ne1 * 2;
 
     // Compute the max m value for the row
-    float m_max = -1.0/0.0;
+    float m_max = (p.sinks == 2 && tid == 0) ? 0.0 : -1.0/0.0;
     for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
         float m = data_a[m_offset + (k + tid) * lm_stride];
         m_max = max(m_max, m);
@@ -57,7 +57,7 @@ void main() {
     barrier();
 
     // Compute L based on m_max
-    float L = 0;
+    float L = (p.sinks == 2 && tid == 0) ? exp(-m_max) : 0.0;
     for (uint k = 0; k + tid < k_num; k += BLOCK_SIZE) {
         float l = data_a[l_offset + (k + tid) * lm_stride];
         float m = data_a[m_offset + (k + tid) * lm_stride];
@@ -77,7 +77,7 @@ void main() {
     L = tmpsh[0];
 
     float sink;
-    if (p.sinks != 0) {
+    if (p.sinks == 1) {
         sink = data_s[n];
 
         float ms = 1.0f;
@@ -104,7 +104,7 @@ void main() {
             float m = data_a[m_offset + k * lm_stride];
             O += exp(m - m_max) * data_a[o_offset];
         }
-        if (p.sinks != 0) {
+        if (p.sinks == 1) {
             if (sink > m_max) {
                 float ms = 1.0f;
                 ms = exp(m_max - sink);

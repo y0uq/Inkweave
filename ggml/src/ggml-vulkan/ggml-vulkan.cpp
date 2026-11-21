@@ -4280,9 +4280,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
+    if (device->subgroup_arithmetic && device->subgroup_min_size >= 16) {
+        for (uint32_t mode = 0; mode <= GGML_INKLING_CONTROL; ++mode) {
+            const bool control = mode == GGML_INKLING_CONTROL;
+            if (control && (!device->subgroup_size_control || device->subgroup_min_size > 32 ||
+                            device->subgroup_max_size < 32)) {
+                continue;
+            }
+            ggml_vk_create_pipeline2(device, device->pipeline_inkling_fused[mode], "inkling_fused_" + std::to_string(mode),
+                inkling_fused_len, inkling_fused_data, "main", 6, 7 * sizeof(uint32_t), {control ? 2u : 64u, 1, 1},
+                {mode}, 1, false, control, control ? 32 : 0);
+        }
+        ggml_vk_create_pipeline(device, device->pipeline_inkling_depth_mix, "inkling_depth_mix",
+            inkling_depth_mix_len, inkling_depth_mix_data, "main", 3, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_residual_scale_f32[0], "ssm_conv_residual_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 1, 1}, {64, 1, 0, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_residual_scale_f32[1], "ssm_conv_residual_scale_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -5096,6 +5112,10 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
+        device->inkling_sparse_experts = device_features2.features.sparseBinding &&
+            device_features2.features.sparseResidencyAliased &&
+            bool(queue_family_props[compute_queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding);
+
         device->device_fault = device->device_fault && fault_features.deviceFault;
 
         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
@@ -5106,8 +5126,11 @@ vk_device ggml_vk_get_device(size_t idx) {
                                                 eInternallySynchronizedKHR :
                                                 vk::DeviceQueueCreateFlags();
 
+        const auto * adaptive = std::getenv("LLAMA_INKLING_EXPERT_ADAPTIVE");
+        const bool extra_expert_queue = adaptive && std::strcmp(adaptive, "1") == 0 && device->inkling_sparse_experts &&
+            compute_queue_family_index != transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount >= 2;
         if (compute_queue_family_index != transfer_queue_family_index) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, extra_expert_queue ? 2u : 1u, priorities});
             device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities + 1});
         } else if(!device->single_queue) {
             device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 2, priorities});
@@ -5567,6 +5590,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->transfer_queue = ggml_vk_create_aliased_queue(device, device->compute_queue);
 
             device->async_use_transfer_queue = false;
+        }
+
+        if (extra_expert_queue) {
+            device->expert_transfer_queue = ggml_vk_create_queue(device, compute_queue_family_index, 1,
+                { vk::PipelineStageFlagBits::eTransfer }, true);
         }
 
         device->fence = device->device.createFence({});
@@ -6419,6 +6447,17 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
+static void ggml_vk_resolve_expert_alias(vk_buffer & buffer, size_t & offset) {
+    if (buffer && !buffer->expert_aliases.empty()) {
+        const auto it = buffer->expert_aliases.find(offset);
+        if (it != buffer->expert_aliases.end()) {
+            auto alias = it->second.buffer;
+            offset = it->second.offset;
+            buffer = std::move(alias);
+        }
+    }
+}
+
 vk_subbuffer ggml_vk_tensor_subbuffer(
     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign) {
 
@@ -6426,6 +6465,7 @@ vk_subbuffer ggml_vk_tensor_subbuffer(
     size_t offset = 0;
     if (ggml_vk_can_bind_host(ctx->device, tensor)) {
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+        ggml_vk_resolve_expert_alias(buffer, offset);
     }
     if (!buffer) {
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
@@ -8322,6 +8362,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (ggml_vk_can_bind_host(ctx->device, src0)) {
         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
+        ggml_vk_resolve_expert_alias(d_Qx, qx_buf_offset);
         src0_uma = d_Qx != nullptr;
     }
     if (ggml_vk_can_bind_host(ctx->device, src1)) {
@@ -8658,6 +8699,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint64_t nei0 = ids->ne[0];
     const uint64_t nei1 = ids->ne[1];
+    const bool batch_routes = nei1 > 1 && ctx->num_additional_fused_ops == 0 &&
+        ctx->device->architecture == vk_device_architecture::AMD_RDNA4 &&
+        nei0 * nei1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1];
     const uint32_t nbi1 = (uint32_t)(ids->nb[1] / sizeof(int));
 
     const uint64_t ne20 = dst->ne[0];
@@ -8742,7 +8786,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, batch_routes ? 1 : nei1);
     }
 
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
@@ -8841,13 +8885,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
-    // Loop over the batch dimension
-    for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+    // One dispatch serves all small-batch routes when the outputs have no fused scales.
+    const uint32_t dispatches = batch_routes ? 1 : nei1;
+    for (uint32_t expert_i1 = 0; expert_i1 < dispatches; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
-            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+            (uint32_t)nei0, (uint32_t)ne11, batch_routes ? UINT32_MAX : expert_i1, nbi1
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
@@ -8858,7 +8903,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_F1,
                 d_ids,
             },
-            pc, { groups_x, (uint32_t)nei0, groups_z });
+            pc, { groups_x, (uint32_t)(batch_routes ? nei0*nei1 : nei0), groups_z });
     }
 
     if (x_non_contig) {
@@ -8872,6 +8917,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
+    static const bool grouped_small = getenv("GGML_VK_INKLING_GROUP_VERIFY") != nullptr;
+    if (grouped_small && ggml_get_op_params_i32(dst, 4) == 1 && ids->ne[1] >= 3) {
+        return false;
+    }
     return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
@@ -9031,10 +9080,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const ggml_tensor * rel = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[6] : nullptr;
     const ggml_tensor * positions = rel ? dst->src[7] : nullptr;
+    const int32_t causal_window = rel ? ggml_get_op_params_i32(dst, 4) : 0;
     const uint32_t nem0 = mask ? mask->ne[0] : 0;
-    const uint32_t nem1 = mask ? mask->ne[1] : 0;
-    const uint32_t nem2 = mask ? mask->ne[2] : 0;
-    const uint32_t nem3 = mask ? mask->ne[3] : 0;
+    const uint32_t nem1 = mask ? mask->ne[1] : causal_window ? neq1 : 0;
+    const uint32_t nem2 = mask ? mask->ne[2] : causal_window ? 1 : 0;
+    const uint32_t nem3 = mask ? mask->ne[3] : causal_window ? 1 : 0;
 
     const uint32_t HSK = nek0;
     const uint32_t HSV = nev0;
@@ -9092,11 +9142,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     // K and V share one scratch buffer, so the sum must fit in one allocation
     const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
+    static const bool bounded_inkling_scratch = getenv("GGML_VK_INKLING_BOUND_ATTN_SCRATCH") != nullptr;
+    // Preserve the short-history conversion path. With long histories, the Q8_0
+    // cooperative matrix shader can load tiles without a full-size F16 copy.
+    const uint64_t inkling_scratch_limit = 256ull << 20;
     const uint32_t cm2_min_queries = KV >= 8192 ? 512 : 1024;
     const uint32_t cm2_min_reuse = KV >= 8192 ? 4096 : 8192;
     // Query reuse must cover the conversion and synchronization cost.
     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
     const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+                                (!rel || !bounded_inkling_scratch || dequant_kv_sz <= inkling_scratch_limit) &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -9116,7 +9171,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, rel == nullptr);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (!rel && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    if ((!rel || causal_window) && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -9126,7 +9181,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, rel == nullptr);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, rel ? std::max(2u, N) : N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, rel == nullptr);
 
     GGML_ASSERT(!rel || (tuning_params.path == FA_COOPMAT1 && !tuning_params.flip));
 
@@ -9216,7 +9271,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr || causal_window, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
     if (positions) {
         fa_pipeline_state.flags |= fa_flag_inkling_kv_pos_map;
     }
@@ -9362,8 +9417,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = CEIL_DIV(KV, split_kv);
     }
 
-    // The split-K reduction accepts one sink per head, while banded attention has one per query.
-    if (rel) {
+    // Small histories cost less in a single dispatch. For long banded decode, each shard
+    // subtracts its row's sink and the merge inserts a single zero-logit sink.
+    if (rel && (neq1 > 32 || KV < 2048)) {
         split_k = 1;
         split_kv = KV;
     }
@@ -9526,7 +9582,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     if (rel) {
         // There is no ALiBi slope in banded attention. Use its low bits for the relative extent.
-        mask_n_head_log2 = (1u << 24) | (1u << 25) | uint32_t(rel->ne[0]);
+        mask_n_head_log2 = (1u << 24) | (1u << 25) | ((causal_window != 0) << 26) | uint32_t(rel->ne[0]);
     }
 
     if (use_mask_opt)
@@ -9577,7 +9633,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                               k_stride, nbk2_eff, nbk3_eff,
                                               v_stride, nbv2_eff, nbv3_eff,
                                               scale, max_bias, logit_softcap,
-                                              mask_n_head_log2, m0, m1,
+                                              mask_n_head_log2, causal_window ? float(causal_window - 1) : m0, m1,
                                               gqa_ratio, split_kv, split_k };
 
     if (xe_fa_opt) {
@@ -9651,12 +9707,20 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
 
         vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, extra_buf},
-                                    pc, { dispatch_x, workgroups_y, workgroups_z });
+        if (positions) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, extra_buf,
+                                         ggml_vk_tensor_subbuffer(ctx, positions)},
+                                        pc, { dispatch_x, workgroups_y, workgroups_z });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, mask_opt_buf, extra_buf},
+                                        pc, { dispatch_x, workgroups_y, workgroups_z });
+        }
 
         ggml_vk_sync_buffers(ctx, subctx);
-        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        const uint32_t sink_mode = rel ? 2 : sinks ? 1 : 0;
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, sink_mode };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
@@ -10300,7 +10364,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
-                case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32;
+                case 2:
+                    if (dst->op == GGML_OP_SCALE) {
+                        return ctx->device->pipeline_ssm_conv_residual_scale_f32[dst->ne[1] > 4];
+                    }
+                    return ctx->device->pipeline_ssm_conv_bias_silu_f32;
                 default: return nullptr;
             }
         }
@@ -11554,7 +11622,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     } else if (ctx->num_additional_fused_ops == 2) {
         ggml_tensor * add = cgraph->nodes[node_idx + 1];
         bias = (add->src[0] == conv) ? add->src[1] : add->src[0];
-        dst = cgraph->nodes[node_idx + 2]; // silu
+        dst = cgraph->nodes[node_idx + 2]; // silu or scale
     }
 
     // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
@@ -11569,6 +11637,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+        dst->op == GGML_OP_SCALE ? ggml_get_op_params_f32(dst, 0) : 1.0f,
     });
 }
 
@@ -11849,6 +11918,17 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 }
 
 void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && src0->type == dst->type &&
+            !ggml_backend_buffer_is_host(src0->buffer) && ggml_backend_buffer_is_host(dst->buffer)) {
+        auto * src = static_cast<ggml_backend_vk_buffer_context *>(src0->buffer->context);
+        const size_t size = ggml_nbytes(dst);
+        if (ggml_vk_buffer_read_2d_async(subctx, src->dev_buffer, vk_tensor_offset(src0) + src0->view_offs,
+                dst->data, size, size, size, 1)) {
+            const vk::MemoryBarrier read(vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead);
+            subctx->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, read, {}, {});
+            return;
+        }
+    }
     uint32_t ne = (uint32_t)ggml_nelements(src0);
     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
         // Convert from number of logical elements to 2- or 4-byte units.
@@ -12894,7 +12974,7 @@ void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& 
 }
 
 void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (float)ggml_get_op_params_i32(dst, 0), 0.0f, 0.0f, 0.0f });
 }
 
 void ggml_vk_count_equal(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -13972,6 +14052,45 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_INKLING_FUSED: {
+        const auto mode = ggml_get_op_params_i32(node, 0);
+        const auto * a = node->src[0];
+        const auto * b = node->src[1];
+        const auto * c = node->src[2];
+        const auto * d = node->src[3];
+        const auto * e = node->src[4];
+        struct {
+            uint32_t width, rows_per_seq, taps_or_slots, channels_per_head, samples, has_b;
+            float value;
+        } pc = { (uint32_t) node->ne[0], (uint32_t) node->ne[1], 0, 0, 0,
+                 b != nullptr, ggml_get_op_params_f32(node, 1) };
+        if (mode == GGML_INKLING_CONV) {
+            pc.taps_or_slots = b->ne[0];
+            pc.samples = a->ne[0];
+            pc.channels_per_head = node->ne[0] * b->ne[0] / c->ne[0];
+        } else if (mode == GGML_INKLING_EXPERT_SUM) {
+            pc.taps_or_slots = a->ne[1];
+            pc.samples = b->ne[2];
+        }
+        auto pipeline = ctx->device->pipeline_inkling_fused[mode];
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const auto a_buf = ggml_vk_tensor_subbuffer(ctx, a);
+        ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline,
+            {a_buf, b ? ggml_vk_tensor_subbuffer(ctx, b) : a_buf, c ? ggml_vk_tensor_subbuffer(ctx, c) : a_buf,
+             d ? ggml_vk_tensor_subbuffer(ctx, d) : a_buf, e ? ggml_vk_tensor_subbuffer(ctx, e) : a_buf,
+             ggml_vk_tensor_subbuffer(ctx, node)},
+            pc, {mode == GGML_INKLING_CLIP ? 64u : pc.width, (uint32_t) ggml_nrows(node), 1});
+        } break;
+    case GGML_OP_INKLING_DEPTH_MIX: {
+        const auto * states = node->src[0];
+        const auto * queries = node->src[1];
+        auto pipeline = ctx->device->pipeline_inkling_depth_mix;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const std::array<uint32_t, 4> pc = {(uint32_t)states->ne[0] / 4, (uint32_t)states->ne[1], (uint32_t)queries->ne[1], (uint32_t)states->ne[2]};
+        ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline,
+            {ggml_vk_tensor_subbuffer(ctx, states), ggml_vk_tensor_subbuffer(ctx, queries), ggml_vk_tensor_subbuffer(ctx, node)},
+            pc, {pc[3], pc[2], 1});
+        } break;
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
 
@@ -14555,6 +14674,48 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+static bool ggml_vk_expert_upload_async(ggml_backend_t backend, const void * const * sources,
+        ggml_tensor * const * targets, const size_t * offsets, const size_t * sizes, size_t count) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    struct copy_group {
+        vk::Buffer src;
+        vk::Buffer dst;
+        std::vector<vk::BufferCopy> ranges;
+    };
+    std::vector<copy_group> groups;
+    for (size_t i = 0; i < count; ++i) {
+        const auto * tensor = targets[i];
+        if (tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend) ||
+                offsets[i] > ggml_nbytes(tensor) || sizes[i] > ggml_nbytes(tensor) - offsets[i]) {
+            return false;
+        }
+        vk_buffer host;
+        size_t src_offset;
+        ggml_vk_host_get(ctx->device, sources[i], host, src_offset);
+        if (!host || sizes[i] == 0 || src_offset > host->size || sizes[i] > host->size - src_offset) {
+            return false;
+        }
+        const auto * buffer = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+        const auto dst = buffer->dev_buffer->buffer;
+        const auto src = host->buffer;
+        auto group = std::find_if(groups.begin(), groups.end(), [src, dst](const copy_group & g) {
+            return g.src == src && g.dst == dst;
+        });
+        if (group == groups.end()) {
+            groups.push_back({ src, dst, {} });
+            group = groups.end() - 1;
+        }
+        group->ranges.emplace_back(src_offset, vk_tensor_offset(tensor) + tensor->view_offs + offsets[i], sizes[i]);
+    }
+
+    auto copy = ctx->device->async_use_transfer_queue ? ggml_vk_get_transfer_ctx(ctx) : ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, copy);
+    for (const auto & g : groups) {
+        copy->s->buffer->buf.copyBuffer(g.src, g.dst, g.ranges);
+    }
+    return true;
+}
+
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -14614,6 +14775,52 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         }
         ggml_vk_synchronize(ctx);
     }
+}
+
+static bool ggml_vk_expert_routes_async(ggml_backend_t backend, ggml_tensor * const * ids,
+        size_t visits, size_t rows, size_t width, int32_t * out) {
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    vk_buffer host;
+    size_t offset;
+    ggml_vk_host_get(ctx->device, out, host, offset);
+    if (!host || offset + visits * rows * width * sizeof(int32_t) > host->size) {
+        return false;
+    }
+
+    struct source {
+        vk::Buffer buffer;
+        std::vector<vk::BufferCopy> slices;
+    };
+    std::vector<source> copies;
+    for (size_t visit = 0; visit < visits; ++visit) {
+        const auto * t = ids[visit];
+        if (!t || t->type != GGML_TYPE_I32 || (size_t) t->ne[0] > width || (size_t) t->ne[1] != rows ||
+                t->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend)) {
+            return false;
+        }
+        auto * buffer_ctx = static_cast<ggml_backend_vk_buffer_context *>(t->buffer->context);
+        const auto buffer = buffer_ctx->dev_buffer->buffer;
+        auto entry = std::find_if(copies.begin(), copies.end(), [buffer](const source & s) { return s.buffer == buffer; });
+        if (entry == copies.end()) {
+            copies.push_back({ buffer, {} });
+            entry = copies.end() - 1;
+            entry->slices.reserve(visits * rows);
+        }
+        const size_t src = vk_tensor_offset(t) + t->view_offs;
+        for (size_t row = 0; row < rows; ++row) {
+            entry->slices.emplace_back(src + row * t->nb[1], offset + (visit * rows + row) * width * sizeof(int32_t),
+                    t->ne[0] * sizeof(int32_t));
+        }
+    }
+    auto compute = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, compute);
+    auto cmd = compute->s->buffer->buf;
+    for (const auto & src : copies) {
+        cmd.copyBuffer(src.buffer, host->buffer, src.slices);
+    }
+    const vk::MemoryBarrier read(vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead);
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, read, {}, {});
+    return true;
 }
 
 static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -15032,6 +15239,22 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     }
 
     return true;
+}
+
+static bool ggml_vk_can_fuse_conv_residual_scale(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_CONV_RESIDUAL_SCALE") != nullptr;
+    if (disabled || !ggml_can_fuse(graph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * conv = graph->nodes[i];
+    const ggml_tensor * add = graph->nodes[i + 1];
+    const ggml_tensor * scale = graph->nodes[i + 2];
+    const ggml_tensor * residual = add->src[0] == conv ? add->src[1] : add->src[0];
+    return scale->src[0] == add && (add->src[0] == conv || add->src[1] == conv) &&
+           residual->type == GGML_TYPE_F32 && ggml_are_same_shape(conv, residual) &&
+           ggml_is_contiguous(residual) && ggml_is_contiguous(scale) &&
+           get_misalign_bytes(ctx, residual) == 0 && get_misalign_bytes(ctx, scale) == 0 &&
+           ggml_get_op_params_f32(scale, 1) == 0.0f;
 }
 
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -15767,6 +15990,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_conv_residual_scale(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "SSM_CONV_RESIDUAL_SCALE";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -16844,9 +17073,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
             if (!enabled || strcmp(enabled, "1") != 0 || device->architecture != vk_device_architecture::AMD_RDNA4 ||
                 device->coopmat2 || !device->coopmat1_fa_support || !device->coopmat_support_16x16x16_f32acc ||
-                !op->src[3] || op->src[3]->ne[2] != 1 || op->src[3]->ne[3] != 1 ||
+                (op->src[3] ? (op->src[3]->ne[2] != 1 || op->src[3]->ne[3] != 1) :
+                               (!positions || ggml_get_op_params_i32(op, 4) <= 0)) ||
                 op->src[1]->type != GGML_TYPE_Q8_0 || op->src[2]->type != GGML_TYPE_Q8_0 ||
-                op->src[1]->ne[0] != 128 || op->src[2]->ne[0] != 128 || op->src[0]->ne[1] <= 32 ||
+                op->src[1]->ne[0] != 128 || op->src[2]->ne[0] != 128 ||
                 !rel || rel->type != GGML_TYPE_F32 || rel->ne[0] > 65535 || !ggml_is_contiguous(rel) ||
                 !sink || sink->ne[0] != op->src[0]->ne[2] || sink->ne[1] != op->src[0]->ne[1] ||
                 op->src[0]->ne[3] != 1 || !ggml_is_contiguous(sink) || ggml_prec_get_acc(op) != GGML_PREC_F32) {
@@ -17344,6 +17574,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_INKLING_FUSED: {
+            const auto mode = ggml_get_op_params_i32(op, 0);
+            const bool has_wave32 = device->subgroup_size_control && device->subgroup_min_size <= 32 &&
+                                    device->subgroup_max_size >= 32;
+            return device->architecture == vk_device_architecture::AMD_RDNA4 &&
+                   device->subgroup_arithmetic && device->subgroup_min_size >= 16 &&
+                   (mode != GGML_INKLING_CONTROL || has_wave32) &&
+                   ggml_nrows(op) <= device->properties.limits.maxComputeWorkGroupCount[1];
+        }
+        case GGML_OP_INKLING_DEPTH_MIX: {
+            static const bool enabled = getenv("GGML_VK_INKLING_DEPTH_MIX") != nullptr;
+            const auto * states = op->src[0];
+            const auto * queries = op->src[1];
+            return enabled && device->subgroup_arithmetic && device->subgroup_min_size >= 16 &&
+                   states->type == GGML_TYPE_F32 && queries->type == GGML_TYPE_F32 &&
+                   (states->ne[0] % 4) == 0 && states->ne[1] <= 16 &&
+                   ggml_is_contiguous(states) && ggml_is_contiguous(queries);
+        }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
@@ -17564,6 +17812,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static size_t ggml_backend_vk_cache_expert_pages(ggml_backend_dev_t dev, const ggml_tensor * tensor,
+        const uint32_t * experts, size_t count, size_t budget, size_t * admitted, bool adaptive) {
+    auto device = ggml_vk_get_device(static_cast<ggml_backend_vk_device_context *>(dev->context)->device);
+    *admitted = 0;
+    if (!ggml_vk_direct_host_enabled(device->idx) || !ggml_vk_can_bind_host(device, tensor) ||
+            !ggml_is_contiguous(tensor) || tensor->ne[3] != 1) {
+        return 0;
+    }
+    return ggml_vk_cache_expert_pages(device, tensor, experts, count, budget, admitted, adaptive);
+}
+
+static void * ggml_backend_vk_expert_updates_create(ggml_backend_dev_t dev) {
+    auto device = ggml_vk_get_device(static_cast<ggml_backend_vk_device_context *>(dev->context)->device);
+    return ggml_vk_expert_updates_create_for_device(std::move(device));
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
 #if !defined(_WIN32)
@@ -17591,6 +17855,27 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
         return (void *) ggml_backend_vk_fusion_set_enabled;
+    }
+    if (strcmp(name, "ggml_backend_vk_cache_expert_pages") == 0) {
+        return (void *) ggml_backend_vk_cache_expert_pages;
+    }
+    if (strcmp(name, "ggml_vk_expert_routes_async") == 0) {
+        return (void *) ggml_vk_expert_routes_async;
+    }
+    if (strcmp(name, "ggml_vk_expert_upload_async") == 0) {
+        return (void *) ggml_vk_expert_upload_async;
+    }
+    if (strcmp(name, "ggml_vk_expert_updates_create") == 0) {
+        return (void *) ggml_backend_vk_expert_updates_create;
+    }
+    if (strcmp(name, "ggml_vk_expert_updates_destroy") == 0) {
+        return (void *) ggml_vk_expert_updates_destroy;
+    }
+    if (strcmp(name, "ggml_vk_expert_updates_poll") == 0) {
+        return (void *) ggml_vk_expert_updates_poll;
+    }
+    if (strcmp(name, "ggml_vk_expert_updates_submit") == 0) {
+        return (void *) ggml_vk_expert_updates_submit;
     }
     return nullptr;
 }
@@ -17824,11 +18109,13 @@ vk_device_struct::~vk_device_struct() {
 
     if (compute_queue) compute_queue->cmd_pool.destroy(device);
     if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
+    if (expert_transfer_queue) expert_transfer_queue->cmd_pool.destroy(device);
 
     // Explicitly clear to ensure queues drop their shared_ptrs to handles
     // before the Vulkan logical device instance is destroyed
     compute_queue.reset();
     transfer_queue.reset();
+    expert_transfer_queue.reset();
 
     for (auto& pipeline : all_pipelines) {
         if (pipeline.expired()) {

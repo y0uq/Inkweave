@@ -1,0 +1,101 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) readonly buffer C { float c[]; };
+layout(binding = 3) readonly buffer D { float d[]; };
+layout(binding = 4) readonly buffer E { float e[]; };
+layout(binding = 5) writeonly buffer Out { float dst[]; };
+
+layout(push_constant) uniform Shape {
+    uint width;
+    uint rows_per_seq;
+    uint taps_or_slots;
+    uint channels_per_head;
+    uint samples;
+    uint has_b;
+    float value;
+} p;
+
+shared float partial[4];
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint off = row * p.width;
+    if (MODE == 0) {
+        const uint woff = (row % p.rows_per_seq) * p.width;
+        float sum = 0.0;
+        for (uint x = lane; x < p.width; x += 64) {
+            const float v = a[off + x] * (p.has_b != 0 ? b[woff + x] : 1.0);
+            sum += v*v;
+        }
+        const float lane_sum = subgroupAdd(sum);
+        if (subgroupElect()) {
+            partial[gl_SubgroupID] = lane_sum;
+        }
+        barrier();
+        sum = 0.0;
+        for (uint i = 0; i < gl_NumSubgroups; ++i) {
+            sum += partial[i];
+        }
+        const float factor = min(1.0, p.value/(sqrt(sum) + 1e-6));
+        for (uint x = lane; x < p.width; x += 64) {
+            dst[off + x] = a[off + x] * (p.has_b != 0 ? b[woff + x] : 1.0) * factor;
+        }
+        return;
+    }
+
+    if (MODE == 4) {
+        const uint channel = 2 * gl_WorkGroupID.x + gl_SubgroupID;
+        if (channel < p.width) {
+            const uint l = gl_SubgroupInvocationID;
+            const uint f = channel * 64 + l;
+            const float t0 = c[row*64 + l];
+            const float t1 = c[row*64 + l + 32];
+            const float gain = subgroupAdd(d[f]*t0 + d[f + 32]*t1);
+            const float forget = subgroupAdd(e[f]*t0 + e[f + 32]*t1);
+            if (subgroupElect()) {
+                const uint idx = off + channel;
+                dst[idx] = (1.0 - tanh(forget))*a[idx] + tanh(gain)*b[idx];
+            }
+        }
+        return;
+    }
+    const uint x = gl_GlobalInvocationID.x;
+    if (x >= p.width) {
+        return;
+    }
+    if (MODE == 1) {
+        const uint i = off + x;
+        dst[i] = (1.0 - tanh(d[i]))*a[i] + tanh(c[i])*b[i];
+    } else if (MODE == 2) {
+        const uint taps = p.taps_or_slots;
+        const uint seq = row / p.rows_per_seq;
+        const uint time = row % p.rows_per_seq;
+        const uint window = (seq*p.width + x)*p.samples + time;
+        const uint dyn = (row*(p.width / p.channels_per_head) + x/p.channels_per_head)*taps;
+        precise float sum = 0.0;
+        for (uint lag = 0; lag < taps; ++lag) {
+            sum += a[window + lag]*b[x*taps + lag];
+        }
+        for (uint lag = 0; lag < taps; ++lag) {
+            sum += a[window + taps - 1 - lag]*c[dyn + lag];
+        }
+        dst[off + x] = (sum + d[off + x])*p.value;
+    } else {
+        const uint slots = p.taps_or_slots;
+        const uint weight_offset = p.samples == 1 ? 0 : row*slots;
+        precise float sum = a[row*slots*p.width + x] * b[weight_offset];
+        for (uint j = 1; j < slots; ++j) {
+            sum += a[(row*slots + j)*p.width + x] * b[weight_offset + j];
+        }
+        dst[off + x] = sum;
+    }
+}

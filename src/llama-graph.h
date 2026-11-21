@@ -45,6 +45,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
     LLM_GRAPH_TYPE_DRAFT_BACKBONE,
+    LLM_GRAPH_TYPE_DRAFT_GREEDY,
     LLM_GRAPH_TYPE_DRAFT_HEAD,
 };
 
@@ -825,7 +826,9 @@ public:
     // [base, swa] K/V cells of the banded attention, 0 = dense
     uint32_t n_kv_banded[2] = { 0, 0 };
     bool     banded_swa_explicit = false;
-    ggml_tensor * banded_swa_positions = nullptr;
+    bool     banded_causal_map = false;
+    bool     banded_prompt_positions = false;
+    ggml_tensor * banded_positions[2] = {};
     bool     banded         = false;
 
     const uint32_t extent;
@@ -978,6 +981,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.inkling_capture_routes == other.cparams.inkling_capture_routes &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
@@ -1045,6 +1049,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_draft_tokens = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1060,6 +1065,7 @@ public:
 
     // [0] is the LLAMA_MOE_RANDOM_ROUTING input, the rest are views of it
     std::vector<ggml_tensor *> t_moe_ids;
+    std::vector<ggml_tensor *> t_inkling_routes;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;

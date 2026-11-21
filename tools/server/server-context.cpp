@@ -17,6 +17,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -4641,9 +4642,12 @@ private:
         }
 
         bool has_output = false;
+        bool collect_generated = true;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            collect_generated &= !batch.tokens[i].is_prompt;
         }
+        llama_inkling_collect_routes(ctx_tgt, has_output && collect_generated ? batch.view.size() : 0);
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -4656,6 +4660,7 @@ private:
         });
 
         if (ret != 0) {
+            llama_inkling_collect_routes(ctx_tgt, 0);
             {
                 std::string err;
 
@@ -4754,6 +4759,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        uint32_t committed_rows = 0;
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4828,6 +4834,9 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+            if (tok_idx == 0 && !batch.tokens[off].is_prompt) {
+                committed_rows = 1;
+            }
 
             llama_token id;
             {
@@ -4956,6 +4965,9 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                if (spec_i_batch.front() == off) {
+                    committed_rows = accepted.size();
+                }
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
@@ -5019,6 +5031,7 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+        llama_inkling_commit_routes(ctx_tgt, committed_rows);
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model

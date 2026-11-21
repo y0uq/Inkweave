@@ -124,6 +124,10 @@ LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
+// Server hooks for single-sequence generation. Commit after synchronizing the graph.
+LLAMA_API void llama_inkling_collect_routes(struct llama_context * ctx, uint32_t rows);
+LLAMA_API void llama_inkling_commit_routes(struct llama_context * ctx, uint32_t rows);
+
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
@@ -175,6 +179,10 @@ LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * m
 
 // Inkling2 DSpark: decode the block backbone once, exposing base logits and hidden rows through the usual getters.
 LLAMA_API int32_t llama_draft_backbone(struct llama_context * ctx, const struct llama_batch_ext * batch);
+
+// Inkling2 DSpark: run the full noncausal block and score the output-marked prefix.
+LLAMA_API int32_t llama_draft_greedy(struct llama_context * ctx, const struct llama_batch_ext * batch);
+LLAMA_API llama_token llama_draft_get_token_ith(struct llama_context * ctx, int32_t i);
 
 // Evaluate one recurrent head step without touching KV. Inputs and rank state are host F32 buffers.
 LLAMA_API bool llama_draft_step(struct llama_context * ctx, llama_token token, llama_embd hidden, llama_embd base,

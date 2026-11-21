@@ -141,6 +141,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             import_info.pHostPointer = import_ptr;
             import_info.setPNext(&mem_flags_info);
             buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
+            buf->allocation_size = size;
+            buf->memory_type = memory_type_idx;
         } catch (const vk::SystemError& e) {
         }
     } else {
@@ -158,6 +160,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
                 try {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                    buf->allocation_size = mem_req.size;
+                    buf->memory_type = *mtype_it;
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
                     done = true;
                     break;
@@ -1026,6 +1030,430 @@ void ggml_vk_buffer_copy_n(const vk_buffer_copy_region * regions, size_t n) {
     vk_context subctx = ggml_vk_begin_sync_ctx(device, device->transfer_queue->cmd_pool);
     ggml_vk_buffer_copy_n_async(subctx, same_device.data(), same_device.size());
     ggml_vk_submit_sync(device, subctx);
+}
+
+struct vk_expert_page_bank {
+    struct page_entry {
+        int32_t slot = -1;
+        uint16_t refs = 0;
+    };
+
+    vk_buffer inactive;
+    size_t base = 0;
+    size_t offset = 0;
+    size_t stride = 0;
+    size_t page = 0;
+    size_t capacity = 0;
+    size_t experts = 0;
+    std::vector<page_entry> active_pages;
+    std::vector<page_entry> inactive_pages;
+
+    size_t first_page(size_t id) const { return (offset + id * stride) / page; }
+    size_t end_page(size_t id) const { return CEIL_DIV(offset + (id + 1) * stride, page); }
+};
+
+static void ggml_vk_bind_sparse(vk_queue & target, const vk::BindSparseInfo & info, vk::Fence fence = {}) {
+    auto & queue = *target.handle;
+    std::unique_lock<std::mutex> submit_guard;
+    if (queue.device_submit_mutex) {
+        submit_guard = std::unique_lock<std::mutex>(*queue.device_submit_mutex);
+    }
+    std::lock_guard<vk_queue_handle> queue_guard(queue);
+    queue.queue.bindSparse(info, fence);
+}
+
+struct vk_expert_update {
+    struct bank_update {
+        vk_buffer host;
+        vk_expert_alias * alias;
+        std::vector<vk_expert_page_bank::page_entry> pages;
+        std::vector<vk::SparseMemoryBind> bindings;
+    };
+
+    vk_device device;
+    vk_queue & queue;
+    vk::UniqueCommandPool pool;
+    vk::CommandBuffer cmd;
+    vk::UniqueSemaphore uploaded;
+    vk::UniqueSemaphore mapped;
+    uint64_t epoch = 0;
+    bool enabled = true;
+    std::vector<bank_update> pending;
+
+    vk_expert_update(vk_device device, vk_queue & queue) : device(std::move(device)), queue(queue) {
+        auto & d = *this->device;
+        const auto family = queue.queue_family_index;
+        pool = d.device.createCommandPoolUnique({ vk::CommandPoolCreateFlagBits::eTransient, family });
+        cmd = d.device.allocateCommandBuffers({ *pool, vk::CommandBufferLevel::ePrimary, 1 }).front();
+        const vk::SemaphoreTypeCreateInfo type(vk::SemaphoreType::eTimeline, 0);
+        vk::SemaphoreCreateInfo info;
+        info.setPNext(&type);
+        uploaded = d.device.createSemaphoreUnique(info);
+        mapped = d.device.createSemaphoreUnique(info);
+    }
+
+    ~vk_expert_update() {
+        if (epoch == 0) {
+            return;
+        }
+        // Both queues can reference the update semaphores until the context is closed.
+        try {
+            for (auto * q : { &queue, device->compute_queue.get() }) {
+                std::lock_guard<vk_queue_handle> guard(*q->handle);
+                q->handle->queue.waitIdle();
+            }
+        } catch (const vk::SystemError & error) {
+            GGML_LOG_WARN("ggml_vulkan: draining expert updates: %s\n", error.what());
+        }
+    }
+};
+
+void * ggml_vk_expert_updates_create_for_device(vk_device device) {
+    auto * queue = device->expert_transfer_queue ? device->expert_transfer_queue.get() : device->transfer_queue.get();
+    if (!device->inkling_sparse_experts || queue->handle == device->compute_queue->handle ||
+            queue->queue_family_index != device->compute_queue->queue_family_index) {
+        return nullptr;
+    }
+    try {
+        return new vk_expert_update(std::move(device), *queue);
+    } catch (const vk::SystemError & error) {
+        GGML_LOG_WARN("ggml_vulkan: creating expert updates: %s\n", error.what());
+        return nullptr;
+    }
+}
+
+void ggml_vk_expert_updates_destroy(void * handle) {
+    delete static_cast<vk_expert_update *>(handle);
+}
+
+// The target context calls this after its graph has completed. A late upload
+// or mapping keeps the previous aliases available for another graph.
+int ggml_vk_expert_updates_poll(void * handle) {
+    auto & tx = *static_cast<vk_expert_update *>(handle);
+    if (!tx.enabled) {
+        return -1;
+    }
+    if (tx.pending.empty()) {
+        return 0;
+    }
+    auto & d = *tx.device;
+    try {
+        if (d.device.getSemaphoreCounterValue(*tx.mapped) < tx.epoch ||
+                d.device.getSemaphoreCounterValue(*tx.uploaded) < tx.epoch) {
+            return 0;
+        }
+
+        const vk::Semaphore ready[] = { *tx.uploaded, *tx.mapped };
+        const uint64_t values[] = { tx.epoch, tx.epoch };
+        const vk::PipelineStageFlags stages[] = { vk::PipelineStageFlagBits::eAllCommands,
+                                                vk::PipelineStageFlagBits::eAllCommands };
+        const vk::TimelineSemaphoreSubmitInfo time(2, values, 0, nullptr);
+        vk::SubmitInfo wait(2, ready, stages, 0, nullptr, 0, nullptr);
+        wait.setPNext(&time);
+        d.compute_queue->handle->submit(wait, {});
+        for (auto & update : tx.pending) {
+            auto & bank = *update.alias->bank;
+            update.alias->buffer.swap(bank.inactive);
+            bank.inactive_pages = std::move(bank.active_pages);
+            bank.active_pages = std::move(update.pages);
+        }
+        tx.pending.clear();
+        return 1;
+    } catch (const vk::SystemError & error) {
+        GGML_LOG_WARN("ggml_vulkan: publishing expert updates: %s\n", error.what());
+        tx.enabled = false;
+        return -1;
+    }
+}
+
+static bool ggml_vk_stage_expert(vk_expert_update & tx, const ggml_tensor * tensor, uint32_t add, uint32_t remove,
+        std::vector<vk_buffer_copy_region> & copies) {
+    vk_buffer host;
+    size_t offset;
+    ggml_vk_host_get(tx.device, tensor->data, host, offset);
+    if (!host) {
+        return false;
+    }
+    const auto it = host->expert_aliases.find(offset);
+    if (it == host->expert_aliases.end() || !it->second.bank) {
+        return false;
+    }
+    auto & alias = it->second;
+    auto & bank = *alias.bank;
+    if (add == remove || add >= bank.experts || remove >= bank.experts) {
+        return false;
+    }
+    for (const auto & update : tx.pending) {
+        if (update.alias == &alias) {
+            return false;
+        }
+    }
+    auto pages = bank.active_pages;
+    const size_t page = bank.page;
+    std::vector<uint8_t> occupied(bank.capacity);
+    for (const auto & entry : pages) {
+        if (entry.slot >= 0) {
+            occupied[entry.slot] = 1;
+        }
+    }
+    for (size_t i = bank.first_page(remove); i < bank.end_page(remove); ++i) {
+        if (pages[i].refs == 0) {
+            return false;
+        }
+        --pages[i].refs;
+    }
+    size_t free_slot = 0;
+    const auto local = alias.buffer->expert_pages;
+    size_t last_copy = copies.size();
+    for (size_t i = bank.first_page(add); i < bank.end_page(add); ++i) {
+        auto & entry = pages[i];
+        ++entry.refs;
+        if (entry.slot >= 0) {
+            continue;
+        }
+        while (free_slot < occupied.size() && occupied[free_slot]) {
+            ++free_slot;
+        }
+        if (free_slot == occupied.size()) {
+            return false;
+        }
+        entry.slot = free_slot++;
+        const size_t dst = entry.slot * page;
+        const size_t src = bank.base + i * page;
+        const size_t bytes = std::min(page, host->size > src ? host->size - src : 0) / 4 * 4;
+        if (!bytes) {
+            return false;
+        }
+        if (copies.size() > last_copy && copies.back().dst_offset + copies.back().size == dst &&
+                copies.back().src_offset + copies.back().size == src) {
+            copies.back().size += bytes;
+        } else {
+            copies.push_back({ local, dst, host, src, bytes });
+        }
+    }
+
+    std::vector<vk::SparseMemoryBind> binds;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        auto & entry = pages[i];
+        if (!entry.refs) {
+            entry.slot = -1;
+        }
+        if (entry.slot == bank.inactive_pages[i].slot) {
+            continue;
+        }
+        const auto mem = entry.slot >= 0 ? local->device_memory : host->device_memory;
+        const size_t off = entry.slot >= 0 ? entry.slot * page : bank.base + i * page;
+        if (!binds.empty() && binds.back().memory == mem && binds.back().memoryOffset + binds.back().size == off &&
+                binds.back().resourceOffset + binds.back().size == i * page) {
+            binds.back().size += page;
+        } else {
+            binds.emplace_back(i * page, page, mem, off);
+        }
+    }
+    tx.pending.push_back({ std::move(host), &alias, std::move(pages), std::move(binds) });
+    return true;
+}
+
+bool ggml_vk_expert_updates_submit(void * handle, const ggml_tensor * const * tensors,
+        const uint32_t * incoming, const uint32_t * outgoing, size_t count) {
+    auto & tx = *static_cast<vk_expert_update *>(handle);
+    if (!tx.enabled || !tx.pending.empty() || !count) {
+        return false;
+    }
+    std::vector<vk_buffer_copy_region> copies;
+    for (size_t i = 0; i < count; ++i) {
+        if (!ggml_vk_stage_expert(tx, tensors[i], incoming[i], outgoing[i], copies)) {
+            tx.pending.clear();
+            return false;
+        }
+    }
+    auto & d = *tx.device;
+    try {
+        d.device.resetCommandPool(*tx.pool);
+        tx.cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        for (const auto & copy : copies) {
+            tx.cmd.copyBuffer(copy.src->buffer, copy.dst->buffer, { vk::BufferCopy(copy.src_offset, copy.dst_offset, copy.size) });
+        }
+        tx.cmd.end();
+
+        ++tx.epoch;
+        const vk::TimelineSemaphoreSubmitInfo time(0, nullptr, 1, &tx.epoch);
+        vk::SubmitInfo upload(0, nullptr, nullptr, 1, &tx.cmd, 1, &*tx.uploaded);
+        upload.setPNext(&time);
+        tx.queue.handle->submit(upload, {});
+
+        std::vector<vk::SparseBufferMemoryBindInfo> bindings;
+        for (const auto & update : tx.pending) {
+            if (!update.bindings.empty()) {
+                bindings.emplace_back(update.alias->bank->inactive->buffer, update.bindings);
+            }
+        }
+        vk::BindSparseInfo map;
+        map.setPNext(&time).setBufferBinds(bindings).setSignalSemaphores(*tx.mapped);
+        ggml_vk_bind_sparse(tx.queue, map);
+        return true;
+    } catch (const vk::SystemError & error) {
+        GGML_LOG_WARN("ggml_vulkan: queueing expert updates: %s\n", error.what());
+        tx.enabled = false;
+        return false;
+    }
+}
+
+// Preserve the original offsets as seen by indexed GEMMs. Vulkan translates the
+// virtual pages into either their pinned host backing or a read-only VRAM copy.
+size_t ggml_vk_cache_expert_pages(vk_device & device, const ggml_tensor * tensor,
+        const uint32_t * expert_ids, size_t count, size_t budget, size_t * admitted, bool adaptive) {
+    *admitted = 0;
+    vk_buffer host;
+    size_t host_offset;
+    ggml_vk_host_get(device, tensor->data, host, host_offset);
+    if (!device->inkling_sparse_experts || !host || !host->ptr ||
+        host->memory_type == UINT32_MAX || host->expert_aliases.count(host_offset)) {
+        return 0;
+    }
+
+    std::lock_guard<std::recursive_mutex> device_guard(device->mutex);
+    auto alias = std::make_shared<vk_buffer_struct>();
+    alias->device = device;
+    // Leave room for the tensor offset within its first sparse page.
+    constexpr size_t max_page = 65536;
+    const auto usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc;
+    const auto flags = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseAliased;
+    try {
+        alias->buffer = device->device.createBuffer({ flags, ggml_nbytes(tensor) + max_page, usage });
+        alias->size = ggml_nbytes(tensor) + max_page;
+        const auto req = device->device.getBufferMemoryRequirements(alias->buffer);
+        const size_t page = req.alignment;
+        if (page > max_page || page < 4 || req.size > device->max_buffer_size ||
+                !(req.memoryTypeBits & (1u << host->memory_type))) {
+            return 0;
+        }
+
+        const size_t base = host_offset / page * page;
+        const size_t local_offset = host_offset - base;
+        const size_t n_pages = CEIL_DIV(req.size, page);
+        const size_t used_pages = CEIL_DIV(local_offset + ggml_nbytes(tensor), page);
+        if (base + used_pages * page > host->allocation_size) {
+            return 0;
+        }
+
+        std::vector<bool> resident(used_pages);
+        size_t resident_pages = 0;
+        size_t chosen = 0;
+        for (; chosen < count; ++chosen) {
+            const size_t expert = expert_ids[chosen];
+            if (expert >= (size_t) tensor->ne[2]) {
+                break;
+            }
+            const size_t begin = (local_offset + expert * tensor->nb[2]) / page;
+            const size_t end = CEIL_DIV(local_offset + (expert + 1) * tensor->nb[2], page);
+            size_t needed = 0;
+            for (size_t j = begin; j < end; ++j) {
+                needed += !resident[j];
+            }
+            if ((resident_pages + needed) * page > budget) {
+                break;
+            }
+            resident_pages += needed;
+            for (size_t j = begin; j < end; ++j) {
+                resident[j] = true;
+            }
+        }
+        if (!resident_pages) {
+            return 0;
+        }
+
+        // Sparse binding requires the whole virtual resource to be mapped. The
+        // last padding pages alias a valid host page and are never addressed.
+        const size_t max_pages_per_expert = CEIL_DIV(tensor->nb[2], page) + 1;
+        const size_t capacity = adaptive ? (chosen + 1) * max_pages_per_expert : resident_pages;
+        if (capacity > budget / page) {
+            return 0;
+        }
+        auto local = ggml_vk_create_buffer_check(device, capacity * page, vk::MemoryPropertyFlagBits::eDeviceLocal);
+        if (!local || !(req.memoryTypeBits & (1u << local->memory_type))) {
+            return 0;
+        }
+        alias->expert_pages = local;
+        std::vector<vk::SparseMemoryBind> bindings;
+        std::vector<vk_buffer_copy_region> copies;
+        std::shared_ptr<vk_expert_page_bank> bank;
+        if (adaptive) {
+            bank = std::make_shared<vk_expert_page_bank>();
+            bank->inactive = std::make_shared<vk_buffer_struct>();
+            bank->inactive->device = device;
+            bank->inactive->buffer = device->device.createBuffer({ flags, alias->size, usage });
+            bank->inactive->size = alias->size;
+            bank->inactive->expert_pages = local;
+            bank->base = base;
+            bank->offset = local_offset;
+            bank->stride = tensor->nb[2];
+            bank->page = page;
+            bank->capacity = capacity;
+            bank->experts = tensor->ne[2];
+            bank->active_pages.resize(used_pages);
+            for (size_t i = 0; i < chosen; ++i) {
+                for (size_t j = bank->first_page(expert_ids[i]); j < bank->end_page(expert_ids[i]); ++j) {
+                    ++bank->active_pages[j].refs;
+                }
+            }
+        }
+        size_t dst_page = 0;
+        for (size_t j = 0; j < used_pages;) {
+            const size_t first = j;
+            const bool in_vram = resident[j++];
+            while (j < used_pages && resident[j] == in_vram) {
+                ++j;
+            }
+            const size_t bytes = (j - first) * page;
+            if (in_vram) {
+                const size_t source = base + first * page;
+                const size_t copy_bytes = std::min(bytes, host->size > source ? host->size - source : 0);
+                copies.push_back({ local, dst_page * page, host, source, copy_bytes / 4 * 4 });
+                bindings.emplace_back(first * page, bytes, local->device_memory, dst_page * page);
+                if (bank) {
+                    for (size_t k = first; k < j; ++k) {
+                        bank->active_pages[k].slot = dst_page + k - first;
+                    }
+                }
+                dst_page += j - first;
+            } else {
+                bindings.emplace_back(first * page, bytes, host->device_memory, base + first * page);
+            }
+        }
+        for (size_t j = used_pages; j < n_pages; ++j) {
+            bindings.emplace_back(j * page, page, host->device_memory, base);
+        }
+
+        // The existing copy helper records one transfer batch and waits for its
+        // completion. The sparse mapping is published only after its own fence.
+        auto transfer = ggml_vk_begin_sync_ctx(device, device->compute_queue->cmd_pool);
+        ggml_vk_buffer_copy_n_async(transfer, copies.data(), copies.size());
+        const vk::MemoryBarrier ready(vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead);
+        transfer->s->buffer->buf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eComputeShader, {}, ready, {}, {});
+        ggml_vk_submit_sync(device, transfer);
+        std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+        buffer_binds.emplace_back(alias->buffer, bindings);
+        if (bank) {
+            buffer_binds.emplace_back(bank->inactive->buffer, bindings);
+            bank->inactive_pages = bank->active_pages;
+        }
+        vk::BindSparseInfo bind_info;
+        bind_info.setBufferBinds(buffer_binds);
+        auto fence = device->device.createFenceUnique({});
+        ggml_vk_bind_sparse(*device->compute_queue, bind_info, *fence);
+        const auto result = device->device.waitForFences(*fence, VK_TRUE, UINT64_MAX);
+        if (result != vk::Result::eSuccess) {
+            return 0;
+        }
+        host->expert_aliases.emplace(host_offset, vk_expert_alias{std::move(alias), local_offset, std::move(bank)});
+        *admitted = chosen;
+        return capacity * page;
+    } catch (const vk::SystemError & error) {
+        GGML_LOG_WARN("ggml_vulkan: expert page cache for %s: %s\n", tensor->name, error.what());
+        return 0;
+    }
 }
 
 ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {

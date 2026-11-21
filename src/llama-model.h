@@ -839,6 +839,7 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+    std::vector<std::vector<uint32_t>> inkling_expert_admission;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;

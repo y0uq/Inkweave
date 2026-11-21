@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1789,6 +1790,113 @@ static void llama_model_loop_views(const llama_hparams & hparams, std::vector<ll
     }
 }
 
+static void llama_inkling_load_expert_cache(llama_model & model) {
+    const char * profile = std::getenv("LLAMA_INKLING_EXPERT_PROFILE");
+    const char * budget_mib = std::getenv("LLAMA_INKLING_EXPERT_CACHE_MIB");
+    if (model.arch != LLM_ARCH_INKLING2 || !profile || !budget_mib || model.n_devices() != 1) {
+        return;
+    }
+    const int requested = std::atoi(budget_mib);
+    if (requested <= 0 || requested > 16384) {
+        throw std::runtime_error("invalid Inkling expert cache budget");
+    }
+    auto * dev = model.dev_layer(0);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const char * adaptive_env = std::getenv("LLAMA_INKLING_EXPERT_ADAPTIVE");
+    const bool adaptive = adaptive_env && std::strcmp(adaptive_env, "1") == 0;
+    using cache_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *, const uint32_t *, size_t, size_t, size_t *, bool);
+    const auto cache = reg ? reinterpret_cast<cache_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_cache_expert_pages")) : nullptr;
+    if (!cache) {
+        throw std::runtime_error("Inkling expert cache requires the Vulkan backend");
+    }
+
+    const size_t n_layer = model.hparams.n_layer_weights();
+    const size_t n_expert = model.hparams.n_expert;
+    std::vector<std::vector<uint32_t>> frequencies(n_layer, std::vector<uint32_t>(n_expert));
+    std::ifstream input(profile);
+    uint32_t layer, expert, freq;
+    while (input >> layer >> expert >> freq) {
+        if (layer >= n_layer || expert >= n_expert) {
+            throw std::runtime_error("Inkling expert profile does not match the checkpoint");
+        }
+        frequencies[layer][expert] = freq;
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("unable to read Inkling expert profile");
+    }
+
+    std::vector<std::vector<uint32_t>> selected(n_layer);
+    struct entry {
+        uint32_t layer;
+        uint32_t expert;
+        size_t bytes;
+        double value;
+    };
+    std::vector<entry> candidates;
+    constexpr size_t page_padding = 2 * 65536; // upper bound per expert and projection
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const auto & l = model.layers[model.hparams.loop_visit(il)];
+        const auto * w1 = l.ffn_gate_up_exps;
+        const auto * w2 = l.ffn_down_exps;
+        if (!w1 || !w2) {
+            continue;
+        }
+        const size_t bytes = w1->nb[2] + w2->nb[2] + 2 * page_padding;
+        for (uint32_t id = 0; id < n_expert; ++id) {
+            if (frequencies[il][id] > 0) {
+                candidates.push_back({il, id, bytes, double(frequencies[il][id]) / bytes});
+            }
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const entry & a, const entry & b) {
+        return a.value > b.value;
+    });
+
+    const size_t budget = (size_t) requested << 20;
+    size_t planned = 0;
+    for (const auto & e : candidates) {
+        // The inactive alias needs enough local pages for one incoming expert per bank.
+        const size_t scratch = adaptive && selected[e.layer].empty() ? e.bytes : 0;
+        if (e.bytes + scratch <= budget - planned) {
+            selected[e.layer].push_back(e.expert);
+            planned += e.bytes + scratch;
+        }
+    }
+
+    size_t total = 0;
+    size_t banks = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const auto & ids = selected[il];
+        if (ids.empty()) {
+            continue;
+        }
+        const auto & l = model.layers[model.hparams.loop_visit(il)];
+        for (const auto * w : {l.ffn_gate_up_exps, l.ffn_down_exps}) {
+            size_t admitted = 0;
+            const size_t bytes = cache(dev, w, ids.data(), ids.size(), budget - total, &admitted, adaptive);
+            if (!bytes || admitted != ids.size()) {
+                throw std::runtime_error(format("unable to cache Inkling expert bank %s", w->name));
+            }
+            ++banks;
+            total += bytes;
+        }
+        std::string ids_log;
+        for (uint32_t id : ids) {
+            ids_log += " " + std::to_string(id);
+        }
+        LLAMA_LOG_INFO("inkling cache layer %u%s\n", il, ids_log.c_str());
+    }
+    if (!banks) {
+        throw std::runtime_error("Inkling expert profile did not admit any weights");
+    }
+    if (adaptive) {
+        model.inkling_expert_admission = std::move(selected);
+    }
+    LLAMA_LOG_INFO("inkling expert cache: %zu banks, %.2f MiB of %d MiB, pinned RAM backing\n",
+        banks, double(total) / (1 << 20), requested);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -2292,6 +2400,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    llama_inkling_load_expert_cache(*this);
 
     llama_model_loop_views(hparams, layers, pimpl->ctx_loop_views);
 

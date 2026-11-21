@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer States { vec4 states[]; };
+layout(binding = 1) readonly buffer Queries { vec4 queries[]; };
+layout(binding = 2) writeonly buffer Output { vec4 output_rows[]; };
+
+layout(push_constant) uniform Shape {
+    uint width4;
+    uint depth;
+    uint query_count;
+    uint token_count;
+} p;
+
+shared float partial[16][8];
+shared float weights[16];
+
+void main() {
+    const uint token = gl_WorkGroupID.x;
+    const uint query = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint state_start = token * p.depth * p.width4;
+    const uint query_start = query * p.width4;
+
+    for (uint d = 0; d < p.depth; ++d) {
+        float sum = 0.0f;
+        for (uint x = lane; x < p.width4; x += gl_WorkGroupSize.x) {
+            sum += dot(queries[query_start + x], states[state_start + d * p.width4 + x]);
+        }
+        const float score = subgroupAdd(sum);
+        if (subgroupElect()) {
+            partial[d][gl_SubgroupID] = score;
+        }
+    }
+    barrier();
+
+    if (lane == 0) {
+        const float scale = inversesqrt(4.0f * p.width4);
+        float max_score = -3.402823466e+38f;
+        for (uint d = 0; d < p.depth; ++d) {
+            float score = 0.0f;
+            for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                score += partial[d][s];
+            }
+            weights[d] = score * scale;
+            max_score = max(max_score, weights[d]);
+        }
+        float sum = 0.0f;
+        for (uint d = 0; d < p.depth; ++d) {
+            weights[d] = exp(weights[d] - max_score);
+            sum += weights[d];
+        }
+        for (uint d = 0; d < p.depth; ++d) {
+            weights[d] /= sum;
+        }
+    }
+    barrier();
+
+    const uint result_start = (token * p.query_count + query) * p.width4;
+    for (uint x = lane; x < p.width4; x += gl_WorkGroupSize.x) {
+        vec4 result = vec4(0.0f);
+        for (uint d = 0; d < p.depth; ++d) {
+            result += states[state_start + d * p.width4 + x] * weights[d];
+        }
+        output_rows[result_start + x] = result;
+    }
+}

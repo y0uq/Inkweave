@@ -216,6 +216,7 @@ void main() {
     // Binding 7 holds either sparse row indices or the banded relative bias.
     const bool banded = (p.mask_n_head_log2 & (1u << 25)) != 0;
     const uint32_t extent = p.mask_n_head_log2 & N_LOG2_MASK;
+    const bool causal_map = (p.mask_n_head_log2 & (1u << 26)) != 0;
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
@@ -257,24 +258,30 @@ void main() {
                             if (banded) {
                                 m = f16vec4(0);
 #ifdef INKLING_KV_POS_MAP
-                                const int key_pos = data_positions[N + kcol];
+                                const int key_pos = data_positions[p.ne2 + kcol];
 #else
                                 const int key_pos = int(kcol);
 #endif
                                 [[unroll]] for (uint a = 0; a < 4; ++a) {
-                                    const uint row = i * Br + r * 4 + a;
-                                    if (row < p.nem1) {
+                                    const uint tile_row = r * 4 + a;
+                                    const uint row = p.gqa_ratio > 1 ? gqa_iq1 : i * Br + tile_row;
+                                    const uint head = iq2 + (p.gqa_ratio > 1 ? tile_row : 0);
+                                    if (row < p.nem1 && (p.gqa_ratio == 1 || tile_row < p.gqa_ratio)) {
 #ifdef INKLING_KV_POS_MAP
                                         const int query_pos = data_positions[row];
 #else
                                         const int query_pos = int(KV - N + row);
 #endif
-                                        const int dist = query_pos - key_pos;
-                                        const uint head_row = row * p.neq2 + iq2;
-                                        const float bias = dist >= 0 && dist < int(extent) ?
-                                            data_rel[head_row * extent + uint(dist)] : 0.0f;
-                                        const float mask = float(data_m[m_offset + row * m_stride + kcol]);
-                                        m[a] = float16_t(mask + (bias - data_s[head_row]));
+                                        const int dist = key_pos == (-2147483647 - 1) ? -1 : query_pos - key_pos;
+                                        const uint head_row = row * p.neq2 + head;
+                                        if (causal_map && (dist < 0 || (p.m0 > 0.0 && dist >= int(p.m0)))) {
+                                            m[a] = float16_t(-1.0/0.0);
+                                        } else {
+                                            const float bias = dist >= 0 && dist < int(extent) ?
+                                                data_rel[head_row * extent + uint(dist)] : 0.0f;
+                                            const float mask = causal_map ? 0.0 : float(data_m[m_offset + row * m_stride + kcol]);
+                                            m[a] = float16_t(mask + (bias - data_s[head_row]));
+                                        }
                                         max_mask = max(max_mask, float(m[a]));
                                     }
                                 }

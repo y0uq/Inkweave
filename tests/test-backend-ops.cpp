@@ -4917,6 +4917,67 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
 
 // GGML_OP_SSM_CONV
+struct test_inkling_fused : public test_case {
+    ggml_inkling_fusion mode;
+
+    explicit test_inkling_fused(ggml_inkling_fusion mode) : mode(mode) {}
+
+    std::string vars() override {
+        return "mode=" + std::to_string(mode);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        switch (mode) {
+            case GGML_INKLING_CLIP:
+                return ggml_inkling_fused(ctx, mode,
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 24, 8),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 24), nullptr, nullptr, 0.5f);
+            case GGML_INKLING_BLEND:
+                return ggml_inkling_fused(ctx, mode,
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3), 0.0f);
+            case GGML_INKLING_CONV:
+                return ggml_inkling_fused(ctx, mode,
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 10, 256, 2),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 256),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 14),
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 7, 2), 1.0f/3.0f);
+            case GGML_INKLING_EXPERT_SUM:
+                return ggml_inkling_fused(ctx, mode,
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2304, 8, 8),
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 8, 8), nullptr, nullptr, 0.0f);
+            case GGML_INKLING_CONTROL:
+                return ggml_inkling_control(ctx,
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 3),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 2304),
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 2304));
+            default:
+                GGML_ABORT("invalid fusion");
+        }
+    }
+};
+
+struct test_inkling_depth_mix : public test_case {
+    int64_t depth;
+    int64_t queries;
+    int64_t tokens;
+
+    test_inkling_depth_mix(int64_t depth, int64_t queries, int64_t tokens) :
+        depth(depth), queries(queries), tokens(tokens) {}
+
+    std::string vars() override { return VARS_TO_STR3(depth, queries, tokens); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * states = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2304, depth, tokens);
+        auto * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2304, queries);
+        return ggml_inkling_depth_mix(ctx, states, weights);
+    }
+};
+
 struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -4979,6 +5040,19 @@ struct test_ssm_conv_bias_silu : public test_case {
 
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+struct test_ssm_conv_residual_scale : public test_ssm_conv {
+    using test_ssm_conv::test_ssm_conv;
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_RESIDUAL_SCALE"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * conv = test_ssm_conv::build_graph(ctx);
+        ggml_tensor * residual = ggml_dup_tensor(ctx, conv);
+        return ggml_scale(ctx, ggml_add(ctx, conv, residual), 0.4472136f);
     }
 };
 
@@ -9370,7 +9444,7 @@ struct test_flash_attn_ext_banded : public test_case {
         ggml_set_name(r, "rel_logits");
 
         ggml_tensor * m = nullptr;
-        if (mask_kind != 0) {
+        if (mask_kind != 0 && mask_kind != 3) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
             ggml_set_name(m, "m");
         }
@@ -9380,6 +9454,9 @@ struct test_flash_attn_ext_banded : public test_case {
             ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q + n_kv);
             ggml_set_name(positions, "positions");
             ggml_flash_attn_ext_banded_set_positions(out, positions);
+            if (mask_kind == 3) {
+                ggml_flash_attn_ext_banded_causal(out, (int32_t) rel_extent);
+            }
         }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
@@ -9404,7 +9481,7 @@ struct test_flash_attn_ext_banded : public test_case {
                     positions[iq] = n_kv - n_q + iq;
                 }
                 for (int64_t ik = 0; ik < n_kv; ++ik) {
-                    positions[n_q + ik] = key_pos(ik);
+                    positions[n_q + ik] = mask_kind == 3 && ik % 13 == 0 ? INT32_MIN : (int32_t) key_pos(ik);
                 }
                 ggml_backend_tensor_set(t, positions.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "rel_logits") == 0) {
@@ -12098,6 +12175,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (auto mode : {GGML_INKLING_CLIP, GGML_INKLING_BLEND, GGML_INKLING_CONV, GGML_INKLING_EXPERT_SUM, GGML_INKLING_CONTROL}) {
+        test_cases.emplace_back(new test_inkling_fused(mode));
+    }
+    test_cases.emplace_back(new test_inkling_depth_mix(3, 1, 1));
+    test_cases.emplace_back(new test_inkling_depth_mix(5, 4, 3));
+    test_cases.emplace_back(new test_inkling_depth_mix(5, 3, 512));
+
     for (int64_t d_conv : {2, 3, 4, 7, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
@@ -12108,6 +12192,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
+
+    test_cases.emplace_back(new test_ssm_conv_residual_scale(GGML_TYPE_F32, {4, 2304, 1, 1}, {4, 2304, 1, 1}));
+    test_cases.emplace_back(new test_ssm_conv_residual_scale(GGML_TYPE_F32, {67, 1024, 2, 1}, {4, 1024, 1, 1}));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
@@ -13702,6 +13789,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8, 2048, 4096, 1024, 1, GGML_TYPE_F16,  GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 48, 8,  512, 3000, 1024, 2, GGML_TYPE_BF16, GGML_TYPE_F32, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 1, 256, 1024, 3, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, 27));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8, 3, 8192, 1024, 3, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, 731));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 8, 8, 1, 32768, 1024, 3, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, 731));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,   79,   79, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512, 2048, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 8,  512, 2048, 1024, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, 2, false, 731));

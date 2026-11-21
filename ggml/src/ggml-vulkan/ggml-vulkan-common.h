@@ -47,6 +47,13 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(size_t size);
 void ggml_vk_host_free(void * ptr);
+size_t ggml_vk_cache_expert_pages(vk_device & device, const ggml_tensor * tensor,
+        const uint32_t * expert_ids, size_t count, size_t budget, size_t * admitted, bool adaptive);
+void * ggml_vk_expert_updates_create_for_device(vk_device device);
+void ggml_vk_expert_updates_destroy(void * handle);
+int ggml_vk_expert_updates_poll(void * handle);
+bool ggml_vk_expert_updates_submit(void * handle, const ggml_tensor * const * tensors,
+        const uint32_t * incoming, const uint32_t * outgoing, size_t count);
 void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset);
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size);
 void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t size);

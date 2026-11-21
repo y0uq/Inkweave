@@ -448,6 +448,9 @@ extern "C" {
 
         GGML_OP_SLEEP,
 
+        GGML_OP_INKLING_DEPTH_MIX,
+        GGML_OP_INKLING_FUSED,
+
         GGML_OP_COUNT,
     };
 
@@ -513,6 +516,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_HOST_INDEPENDENT = 32, // host split inputs are already ready
     };
 
     enum ggml_tri_type {
@@ -903,6 +907,9 @@ extern "C" {
             struct ggml_tensor  * a);
 
     // argmax along rows
+    // Select the lowest index among equal maxima.
+    GGML_API struct ggml_tensor * ggml_argmax_first(struct ggml_context * ctx, struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1340,6 +1347,8 @@ extern "C" {
 
     // indirect matrix multiplication
     // an id of -1 skips the slot and zeroes the matching row of the result
+    GGML_API void ggml_mul_mat_id_group_small(struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2286,6 +2295,11 @@ extern "C" {
             int64_t               rel_extent);
 
     // Override the implicit positions with an I32 vector [Q positions, K positions] for one stream.
+    // Use the position map as a causal mask. INT32_MIN marks an invalid key.
+    // A zero window keeps all valid causal keys.
+    GGML_API void ggml_flash_attn_ext_banded_causal(
+            struct ggml_tensor * a, int32_t window);
+
     GGML_API void ggml_flash_attn_ext_banded_set_positions(
             struct ggml_tensor * a,
             struct ggml_tensor * positions);
@@ -2329,6 +2343,33 @@ extern "C" {
            struct ggml_tensor  * v,
            struct ggml_tensor  * d,
            bool                  masked);
+
+    // Softmax over normalized depth states [width, depth, tokens] for each query [width, queries].
+    enum ggml_inkling_fusion {
+        GGML_INKLING_CLIP,
+        GGML_INKLING_BLEND,
+        GGML_INKLING_CONV,
+        GGML_INKLING_EXPERT_SUM,
+        GGML_INKLING_CONTROL,
+    };
+
+    GGML_API struct ggml_tensor * ggml_inkling_fused(
+            struct ggml_context * ctx,
+            enum ggml_inkling_fusion fusion,
+            struct ggml_tensor * a,
+            struct ggml_tensor * b,
+            struct ggml_tensor * c,
+            struct ggml_tensor * d,
+            float value);
+
+    GGML_API struct ggml_tensor * ggml_inkling_control(
+            struct ggml_context * ctx, struct ggml_tensor * current, struct ggml_tensor * message,
+            struct ggml_tensor * latent, struct ggml_tensor * gain, struct ggml_tensor * forget);
+
+    GGML_API struct ggml_tensor * ggml_inkling_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor * states,
+            struct ggml_tensor * queries);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

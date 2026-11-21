@@ -1581,6 +1581,95 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+static bool ggml_cpu_inkling_masked_matvec;
+
+static bool ggml_compute_forward_inkling_experts(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * w = dst->src[0];
+    const struct ggml_tensor * x = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+    const int n_slots = ids->ne[0];
+    const int n_routes = ggml_nelements(ids);
+    const struct ggml_type_traits_cpu * traits = &type_traits_cpu[w->type];
+    const enum ggml_type dot_type = traits->vec_dot_type;
+    if (x->type != GGML_TYPE_F32 || (dot_type != GGML_TYPE_Q8_0 && dot_type != GGML_TYPE_Q8_K) ||
+            x->ne[3] != 1 || x->ne[2] != ids->ne[1] || (x->ne[1] != 1 && x->ne[1] != n_slots)) {
+        return false;
+    }
+
+    const int32_t * routes = (const int32_t *) ids->data;
+    uint64_t active_rows = 0;
+    bool masked = false;
+    for (int j = 0; j < n_routes; ++j) {
+        if (routes[j] < 0) {
+            masked = true;
+        } else {
+            const int row = j / n_slots * x->ne[1] + j % n_slots % x->ne[1];
+            active_rows |= UINT64_C(1) << row;
+        }
+    }
+    if (!masked) {
+        return false;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t width = x->ne[0];
+    const int64_t block = ggml_blck_size(dot_type);
+    const int64_t lo = width / block * ith / nth;
+    const int64_t hi = width / block * (ith + 1) / nth;
+    const size_t quant_stride = ggml_row_size(dot_type, width);
+    char * quant = params->wdata;
+    GGML_ASSERT(params->wsize >= quant_stride * x->ne[1] * x->ne[2]);
+    for (int row = 0; row < x->ne[1] * x->ne[2]; ++row) {
+        if ((active_rows >> row & 1) && hi > lo) {
+            const char * data = (const char *) x->data + row % x->ne[1] * x->nb[1] + row / x->ne[1] * x->nb[2];
+            type_traits_cpu[dot_type].from_float((const float *) data + lo * block,
+                    quant + row * quant_stride + lo * ggml_type_size(dot_type), (hi - lo) * block);
+        }
+    }
+    if (active_rows) {
+        ggml_barrier(params->threadpool);
+    }
+
+    const int64_t first = dst->ne[0] * ith / nth;
+    const int64_t end = dst->ne[0] * (ith + 1) / nth;
+    uint64_t done = 0;
+    for (int j = 0; j < n_routes; ++j) {
+        if (done >> j & 1) {
+            continue;
+        }
+        const int32_t expert = routes[j];
+        if (expert == -1) {
+            char * out = (char *) dst->data + j % n_slots * dst->nb[1] + j / n_slots * dst->nb[2];
+            memset(out + first * sizeof(float), 0, (end - first) * sizeof(float));
+            continue;
+        }
+        GGML_ASSERT(expert >= 0 && expert < w->ne[2]);
+
+        float * outputs[64];
+        const char * inputs[64];
+        int count = 0;
+        for (int k = j; k < n_routes; ++k) {
+            if (routes[k] == expert) {
+                const int token = k / n_slots;
+                const int slot = k % n_slots;
+                outputs[count] = (float *) ((char *) dst->data + slot * dst->nb[1] + token * dst->nb[2]);
+                inputs[count++] = quant + (token * x->ne[1] + slot % x->ne[1]) * quant_stride;
+                done |= UINT64_C(1) << k;
+            }
+        }
+
+        const char * weights = (const char *) w->data + expert * w->nb[2];
+        for (int64_t r = first; r < end; ++r) {
+            for (int k = 0; k < count; ++k) {
+                traits->vec_dot(width, outputs[k] + r, 0, weights + r * w->nb[1], 0, inputs[k], 0, 1);
+            }
+        }
+    }
+    return true;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1617,6 +1706,24 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+
+    if (ggml_get_op_params_i32(dst, 4) && ggml_nelements(ids) <= 64 && ggml_is_contiguous(ids)) {
+        if (ggml_cpu_inkling_masked_matvec && ggml_compute_forward_inkling_experts(params, dst)) {
+            return;
+        }
+        const int32_t * routes = (const int32_t *) ids->data;
+        const int64_t n_routes = ggml_nelements(ids);
+        bool any_active = false;
+        for (int64_t i = 0; i < n_routes && !any_active; ++i) {
+            any_active = routes[i] != -1;
+        }
+        if (!any_active) {
+            for (int64_t i = ith; i < n_routes; i += nth) {
+                memset((char *) dst->data + (i % n_ids)*nb1 + (i / n_ids)*nb2, 0, ne0*sizeof(float));
+            }
+            return;
+        }
+    }
 
     void * wdata_cur = params->wdata;
 
@@ -2136,6 +2243,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_INKLING_FUSED:
+            {
+                ggml_compute_forward_inkling_fused(params, tensor);
+            } break;
+        case GGML_OP_INKLING_DEPTH_MIX:
+            {
+                ggml_compute_forward_inkling_depth_mix(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2322,6 +2437,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_INKLING_DEPTH_MIX:
+        case GGML_OP_INKLING_FUSED:
         case GGML_OP_TOP_K_MASK:
             {
                 n_tasks = n_threads;
@@ -3969,6 +4086,8 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            env = getenv("GGML_CPU_INKLING_MASKED_MATVEC");
+            ggml_cpu_inkling_masked_matvec = env != NULL && strcmp(env, "1") == 0;
         }
 
         is_first_call = false;

@@ -738,6 +738,7 @@ struct vk_device_struct {
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
+    std::unique_ptr<vk_queue> expert_transfer_queue;
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
@@ -759,6 +760,7 @@ struct vk_device_struct {
     bool multi_add;
     bool shader_int64;
     bool buffer_device_address;
+    bool inkling_sparse_experts = false;
     bool vulkan_memory_model;
     bool shader_clock;
 
@@ -1020,9 +1022,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net_cm_v128;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
+    vk_pipeline pipeline_inkling_depth_mix;
+    vk_pipeline pipeline_inkling_fused[GGML_INKLING_CONTROL + 1];
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_residual_scale_f32[2];
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1093,15 +1098,29 @@ inline void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+struct vk_expert_page_bank;
+
+struct vk_expert_alias {
+    vk_buffer buffer;
+    size_t offset;
+    std::shared_ptr<vk_expert_page_bank> bank;
+};
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
     vk::MemoryPropertyFlags memory_property_flags;
-    void * ptr;
+    void * ptr = nullptr;
     size_t size = 0;
+    size_t allocation_size = 0;
+    uint32_t memory_type = UINT32_MAX;
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+
+    // Only the pinned owner keeps an alias. A sparse alias owns its cached pages.
+    std::map<size_t, vk_expert_alias> expert_aliases;
+    vk_buffer expert_pages;
 
     ~vk_buffer_struct() {
         if (size == 0) {
@@ -1111,8 +1130,11 @@ struct vk_buffer_struct {
 
         // bump before destroying, so a thread that sees the buffer gone also sees the new count
         device->buffer_destroy_count.fetch_add(1, std::memory_order_release);
-        device->device.freeMemory(device_memory);
+        expert_aliases.clear();
         device->device.destroyBuffer(buffer);
+        if (device_memory) {
+            device->device.freeMemory(device_memory);
+        }
     }
 };
 

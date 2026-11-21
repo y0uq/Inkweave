@@ -551,6 +551,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(params);
         case LLM_GRAPH_TYPE_DRAFT_BACKBONE:
+        case LLM_GRAPH_TYPE_DRAFT_GREEDY:
         case LLM_GRAPH_TYPE_DRAFT_HEAD:
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
